@@ -161,7 +161,7 @@ class QATQuantizer:
         if tensor.dim() != 2:
             return False
 
-        # HiF8 per-channel: no block/group size constraint on in_features
+        # HiF8 per-element: no dimension constraint on in_features
         if not self._is_hif8 and tensor.shape[1] % self.group_size != 0:
             return False
 
