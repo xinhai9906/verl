@@ -519,7 +519,6 @@ class FSDPEngine(BaseEngine):
                 "enable": self._qat_config.enable,
                 "mode": self._qat_config.mode,
                 "group_size": self._qat_config.group_size,
-                "block_size": getattr(self._qat_config, "block_size", 32),
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
             },
@@ -893,7 +892,6 @@ class FSDPEngine(BaseEngine):
             quantizer = QATQuantizer(
                 mode=self._qat_config.mode,
                 group_size=self._qat_config.group_size,
-                block_size=getattr(self._qat_config, "block_size", 32),
                 ignore_patterns=list(self._qat_config.ignore_patterns),
                 device=torch.device(get_device_id()),
                 param_dtype=param_dtype,

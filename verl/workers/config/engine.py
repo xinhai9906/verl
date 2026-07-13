@@ -140,8 +140,7 @@ class QATEngineConfig(BaseConfig):
 
     enable: bool = False
     mode: str = "w4a16"  # Supported modes: "w4a16", "w4a4", "w8a8_hif8"
-    group_size: int = 16  # Group size for NVFP4; use block_size for w8a8_hif8
-    block_size: int = 32  # Block size for HiF8 microscaling (default 32)
+    group_size: int = 16  # Group size for NVFP4 blockwise quantization
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None

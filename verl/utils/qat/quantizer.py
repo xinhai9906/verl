@@ -123,23 +123,21 @@ class QATQuantizer:
 
     Supports:
       - w4a16 / w4a4: NVFP4 quantization via compressed_tensors
-      - w8a8_hif8: HiF8 quantization via block-wise shared exponent
+      - w8a8_hif8: HiF8 per-element quantization (no scales)
     """
 
     def __init__(
         self,
         mode: str = "w4a16",
         group_size: int = 16,
-        block_size: int = 32,
         ignore_patterns: Optional[list] = None,
         device: Optional[torch.device] = None,
         param_dtype: Optional[torch.dtype] = None,
     ):
         self.mode = mode.lower()
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
-        self._is_hif8 = self.mode == "w8a8_hif8"  # W8A8 HiF8 mode
+        self._is_hif8 = self.mode == "w8a8_hif8"  # W8A8 HiF8 per-element mode
         self.group_size = group_size
-        self.block_size = block_size
         self.ignore_patterns = ignore_patterns or ["lm_head", "embed_tokens", "re:.*mlp.gate$"]
         self.device = device or torch.device(get_device_name())
         self.param_dtype = param_dtype
