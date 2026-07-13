@@ -88,7 +88,7 @@ def apply_qat(
     model: nn.Module,
     config: QATConfig | dict[str, Any],
 ) -> nn.Module:
-    """Apply QAT to a model by replacing nn.Linear with QATLinear."""
+    """Apply QAT to a model by replacing nn.Linear with QATLinear or HIF8QATLinear."""
     from verl.utils.qat.linear import QATLinear, QATMode
 
     if not isinstance(config, QATConfig):
@@ -98,6 +98,39 @@ def apply_qat(
         logger.info("QAT is disabled, returning original model")
         return model
 
+    # Check for HiF8 mode
+    is_hif8 = config.mode == "w8a8_hif8"
+
+    if is_hif8:
+        from verl.utils.qat.hif8_linear import HIF8QATLinear
+
+        logger.info("Applying QAT with mode=w8a8_hif8 (per-channel weight, per-token activation)")
+
+        modules_to_replace = []
+        for name, module in model.named_modules():
+            if _should_quantize(name, module, config):
+                modules_to_replace.append((name, module))
+
+        logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to HIF8 QAT")
+
+        converted_count = 0
+        for name, module in modules_to_replace:
+            if isinstance(module, HIF8QATLinear):
+                continue
+
+            fake_quant_module = HIF8QATLinear.from_linear(module)
+
+            _set_module(model, name, fake_quant_module)
+            converted_count += 1
+
+        logger.info(f"Successfully applied HIF8 QAT to {converted_count} layers")
+
+        # Setup fusion siblings for QKV/GateUp weight scale fusion
+        setup_fusion_siblings_for_hif8(model)
+
+        return model
+
+    # Standard NVFP4 QAT path
     mode = QATMode(config.mode.lower())
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
 
@@ -193,4 +226,50 @@ def invalidate_all_scales(model: nn.Module):
             module._cached_weight_amax = None
             count += 1
 
-    logger.debug(f"[QAT Fuse] Invalidated scales for {count} QATLinear layers")
+    # Also invalidate HIF8QATLinear cached state if present
+    try:
+        from verl.utils.qat.hif8_linear import HIF8QATLinear
+
+        for module in model.modules():
+            if isinstance(module, HIF8QATLinear):
+                count += 1
+    except ImportError:
+        pass
+
+    logger.debug(f"[QAT Fuse] Invalidated scales for {count} QATLinear/HIF8QATLinear layers")
+
+
+def setup_fusion_siblings_for_hif8(model: nn.Module, hif8_qat_linear_cls=None):
+    """Setup fusion siblings for HIF8 QAT QKV and GateUp layers.
+
+    This enables weight scale fusion for HiF8 quantization, similar to
+    the NVFP4 setup_fusion_siblings function.
+    """
+    import weakref
+
+    if hif8_qat_linear_cls is None:
+        from verl.utils.qat.hif8_linear import HIF8QATLinear as hif8_qat_linear_cls
+
+    hif8_modules = {name: m for name, m in model.named_modules() if isinstance(m, hif8_qat_linear_cls)}
+
+    counts = {}
+    for group_name, suffixes in FUSION_PATTERNS.items():
+        groups: dict[str, dict[str, nn.Module]] = {}
+        for name, module in hif8_modules.items():
+            for suffix in suffixes:
+                if name.endswith(suffix):
+                    parent = name.rsplit(".", 1)[0]
+                    groups.setdefault(parent, {})[suffix] = module
+
+        count = 0
+        for parent, projs in groups.items():
+            if len(projs) >= 2:
+                modules = list(projs.values())
+                for i, m in enumerate(modules):
+                    siblings = modules[:i] + modules[i + 1:]
+                    m._fusion_siblings_ref = [weakref.ref(s) for s in siblings]
+                count += 1
+        counts[group_name] = count
+
+    logger.info(f"[HiF8 QAT Fuse] Setup fusion siblings: {counts}")
+    return counts

@@ -119,32 +119,42 @@ def fuse_global_scales(
 
 
 class QATQuantizer:
-    """Quantizer for QAT-trained weights using compressed_tensors APIs."""
+    """Quantizer for QAT-trained weights using compressed_tensors APIs.
+
+    Supports:
+      - w4a16 / w4a4: NVFP4 quantization via compressed_tensors
+      - w8a8_hif8: HiF8 quantization via block-wise shared exponent
+    """
 
     def __init__(
         self,
         mode: str = "w4a16",
         group_size: int = 16,
+        block_size: int = 32,
         ignore_patterns: Optional[list] = None,
         device: Optional[torch.device] = None,
         param_dtype: Optional[torch.dtype] = None,
     ):
         self.mode = mode.lower()
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
+        self._is_hif8 = self.mode == "w8a8_hif8"  # W8A8 HiF8 mode
         self.group_size = group_size
+        self.block_size = block_size
         self.ignore_patterns = ignore_patterns or ["lm_head", "embed_tokens", "re:.*mlp.gate$"]
         self.device = device or torch.device(get_device_name())
         self.param_dtype = param_dtype
 
-        self._compressor = NVFP4PackedCompressor()
-        self._quant_args = QuantizationArgs(
-            num_bits=4,
-            type=QuantizationType.FLOAT,
-            symmetric=True,
-            strategy=QuantizationStrategy.TENSOR_GROUP,
-            group_size=group_size,
-            scale_dtype=FP8_E4M3_DATA.dtype,
-        )
+        # HiF8 mode doesn't use compressed_tensors
+        if not self._is_hif8:
+            self._compressor = NVFP4PackedCompressor()
+            self._quant_args = QuantizationArgs(
+                num_bits=4,
+                type=QuantizationType.FLOAT,
+                symmetric=True,
+                strategy=QuantizationStrategy.TENSOR_GROUP,
+                group_size=group_size,
+                scale_dtype=FP8_E4M3_DATA.dtype,
+            )
 
     def _should_quantize(self, name: str, tensor: torch.Tensor) -> bool:
         """Check if parameter should be quantized."""
@@ -152,7 +162,9 @@ class QATQuantizer:
             return False
         if tensor.dim() != 2:
             return False
-        if tensor.shape[1] % self.group_size != 0:
+
+        # HiF8 per-channel: no block/group size constraint on in_features
+        if not self._is_hif8 and tensor.shape[1] % self.group_size != 0:
             return False
 
         module_name = name.rsplit(".weight", 1)[0]
@@ -270,6 +282,11 @@ class QATQuantizer:
 
         output_device = target_device or torch.device("cpu")
 
+        # Dispatch to HiF8 path for w8a8_hif8 mode
+        if self._is_hif8:
+            yield from self._quantize_with_fusion_hif8(params, output_device)
+            return
+
         _sentinel = object()
         current_layer_idx = _sentinel
         layer_buffer: dict[str, torch.Tensor] = {}
@@ -301,6 +318,131 @@ class QATQuantizer:
             yield from self._process_layer_group(current_layer_idx, layer_buffer, input_global_scales, output_device)
 
         get_torch_device().empty_cache()
+
+    def _quantize_with_fusion_hif8(
+        self,
+        params: Iterable[tuple[str, torch.Tensor]],
+        output_device: torch.device,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """HiF8 per-channel quantization: quantize weights layer-by-layer.
+
+        For each 2D weight tensor:
+          - Compute per-channel shared exponents (one per output channel)
+          - Quantize to uint8 (offset by 128 for signed HiF8)
+          - Yield (name, weight_uint8) and (name + "_scale", scale_fp32)
+
+        scale shape: (out_features, 1) — matches vllm-ascend W8A8_DYNAMIC pattern.
+        """
+        # HiF8 constants
+        HIF8_15_MAX = 15.0
+
+        _sentinel = object()
+        current_layer_idx = _sentinel
+        layer_buffer: dict[str, torch.Tensor] = {}
+
+        for name, tensor in params:
+            tensor_cpu = tensor.to("cpu") if tensor.is_cuda else tensor
+            layer_idx = self._extract_layer_idx(name)
+
+            # Layer boundary: flush previous layer
+            if layer_idx != current_layer_idx and current_layer_idx is not _sentinel and layer_buffer:
+                yield from self._process_layer_group_hif8(
+                    current_layer_idx, layer_buffer, output_device
+                )
+                layer_buffer = {}
+
+            current_layer_idx = layer_idx
+            layer_buffer[name] = tensor_cpu
+
+        # Flush last buffered layer
+        if layer_buffer:
+            yield from self._process_layer_group_hif8(
+                current_layer_idx, layer_buffer, output_device
+            )
+
+        get_torch_device().empty_cache()
+
+    def _process_layer_group_hif8(
+        self,
+        layer_idx: Optional[int],
+        layer_params: dict[str, torch.Tensor],
+        output_device: torch.device,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Quantize one decoder layer's weights to HiF8 format (per-channel).
+
+        For each weight (out_features, in_features):
+          1. Per-channel shared_exp: ceil(log2(row_amax / HIF8_15_MAX))
+             → shape (out_features, 1)
+          2. Scale = 2^shared_exp
+          3. Quantize: round(weight / scale) → clamp → offset-to-uint8
+          4. Yield (name, weight_uint8) and (name + "_scale", scale_fp32)
+
+        Matches MindSpeed delayed_hif8_pertensor recipe (per-channel granularity)
+        and vllm-ascend W8A8_DYNAMIC pattern (weight_scale: out_features x 1).
+        """
+        HIF8_15_MAX = 15.0
+        layer_weights = {}
+        layer_passthrough = {}
+
+        for name, tensor in layer_params.items():
+            if "input_global_scale" in name or "input_amax" in name:
+                continue
+
+            if self._should_quantize(name, tensor):
+                layer_name = name.rsplit(".weight", 1)[0]
+                layer_weights[layer_name] = (name, tensor)
+            else:
+                layer_passthrough[name] = tensor
+
+        if not layer_weights:
+            return [(name, tensor.to(output_device)) for name, tensor in layer_passthrough.items()]
+
+        results = []
+
+        for layer_name, (param_name, tensor) in layer_weights.items():
+            weight = tensor.to(device=self.device, dtype=torch.float32)
+            out_features, in_features = weight.shape
+
+            # Per-channel amax: max absolute value along in_features dim
+            # shape: (out_features, 1)
+            channel_amax = torch.amax(torch.abs(weight), dim=-1, keepdim=True)
+
+            hif8_max_tensor = torch.tensor(HIF8_15_MAX, dtype=torch.float32, device=self.device)
+
+            # Avoid log2(0)
+            safe_amax = torch.where(
+                channel_amax > 0.0,
+                channel_amax,
+                torch.tensor(1e-38, dtype=torch.float32, device=self.device),
+            )
+
+            # Per-channel shared exponent: shape (out_features, 1)
+            shared_exp = torch.ceil(
+                torch.log2(safe_amax) - torch.log2(hif8_max_tensor)
+            )
+            shared_exp = torch.clamp(shared_exp, -127, 127)
+
+            # Per-channel scale: shape (out_features, 1), broadcastable to (out_features, in_features)
+            scale = torch.pow(2.0, shared_exp.float())
+
+            # Quantize: scale down → round → clamp → offset to uint8
+            quantized = torch.round(weight / scale)
+            # Offset by 128 to map signed HiF8 values to uint8 [0, 255]
+            quantized_offset = torch.clamp(quantized + 128, 0, 255)
+            quantized_uint8 = quantized_offset.to(torch.uint8)
+
+            results.append((param_name, quantized_uint8.to(output_device)))
+
+            # Store per-channel scale as fp32
+            # Dequant: real_value = (uint8_val - 128) * scale
+            scale_name = param_name + "_scale"
+            results.append((scale_name, scale.float().to(output_device)))
+
+        # Passthrough non-quantized params
+        for name, tensor in layer_passthrough.items():
+            results.append((name, tensor.to(output_device)))
+
+        return results
 
 
 __all__ = [

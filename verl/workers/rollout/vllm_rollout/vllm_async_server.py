@@ -1062,6 +1062,12 @@ class vLLMHttpServer:
 
                 apply_qat_patches()
                 quantization = "compressed-tensors"
+            elif quant_method == "ascend-hif8":
+                # HiF8 (W8A8) quantization for Ascend NPU
+                # The W8A8_HIF8 scheme is registered in vllm-ascend,
+                # no special patches needed.
+                quantization = "ascend-hif8"
+                logger.info("QAT HiF8 quantization configured for vLLM Ascend")
             else:
                 raise ValueError(f"Unsupported quant_method: {quant_method}")
 
