@@ -12,19 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""W8A8 HiF8 QAT FakeQuantized Linear module for FSDP training.
+"""W8A8 HiF8 QAT FakeQuantized Linear layer (per-element, no external scale).
 
-This module replaces nn.Linear during QAT training to simulate HiF8
-quantization during the forward pass while keeping bf16 master weights.
-
-Quantization granularity (aligns with MindSpeed delayed_hif8_pertensor):
-  - Weight: per-channel (each output channel gets its own shared exponent)
-  - Activation: per-token dynamic (each token independently quantized)
+Replaces nn.Linear during QAT training to simulate HiF8 inference precision.
+Both weights and activations are independently quantized per-element:
+    x_hif8 = x.to(hifloat8)
+    weight_hif8 = weight.to(hifloat8)
 
 Key design:
   - STE backward: gradients flow through unchanged
-  - fake_quant_enabled toggle: for deployment without re-architecting
-  - FSDP compatible: uses standard nn.Parameter for weight and bias
+  - FSDP compatible: uses standard nn.Parameter
+  - No external scales, no blocks, no shared exponents
 """
 
 from typing import Optional
@@ -33,22 +31,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from verl.utils.qat.hif8_fake_quant import HIF8FakeQuantFunction, HIF8_15_MAX
+from verl.utils.qat.hif8_fake_quant import HIF8FakeQuantFunction
 
 __all__ = ["HIF8QATLinear"]
 
 
 class HIF8QATLinear(nn.Linear):
-    """W8A8 HiF8 FakeQuantized Linear layer with FSDP compatibility.
+    """W8A8 HiF8 FakeQuantized Linear — per-element, native quantization.
 
-    Replaces nn.Linear during QAT for HiF8 quantization. In forward:
-      1. Fake-quantize weight: per-channel → weight_fq
-      2. Fake-quantize activation: per-token → x_fq
-      3. Compute matmul in bf16 with dequantized values
-      4. STE backward passes gradients to bf16 master weights
+    Forward pass:
+      1. weight_fq = weight.to(hifloat8).to(bf16)  — per-element weight quant
+      2. x_fq = x.to(hifloat8).to(bf16)            — per-element activation quant
+      3. output = x_fq @ weight_fq^T + bias        — bf16 matmul
 
-    Compatible with FSDP wrapping — the module uses standard nn.Parameter
-    for weight and bias, so FSDP sharding works transparently.
+    No external scale tensors. Each element is quantized independently
+    by the HiF8 float format's native representable precision.
     """
 
     def __init__(
@@ -56,44 +53,21 @@ class HIF8QATLinear(nn.Linear):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        weight_hif8_max: float = HIF8_15_MAX,
-        act_hif8_max: float = HIF8_15_MAX,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
-
-        self.weight_hif8_max = weight_hif8_max
-        self.act_hif8_max = act_hif8_max
-
-        # Toggle for switching between QAT and vanilla forward
         self.fake_quant_enabled: bool = True
 
     @classmethod
-    def from_linear(
-        cls,
-        linear: nn.Linear,
-        weight_hif8_max: float = HIF8_15_MAX,
-        act_hif8_max: float = HIF8_15_MAX,
-    ) -> "HIF8QATLinear":
-        """Create HIF8QATLinear from an existing nn.Linear, copying weights.
-
-        Args:
-            linear: Source nn.Linear module.
-            weight_hif8_max: Max value for weight quantization. Default HIF8_15_MAX.
-            act_hif8_max: Max value for activation quantization. Default HIF8_15_MAX.
-
-        Returns:
-            New HIF8QATLinear with copied parameters.
-        """
+    def from_linear(cls, linear: nn.Linear) -> "HIF8QATLinear":
+        """Create HIF8QATLinear from an existing nn.Linear, copying weights."""
         has_bias = linear.bias is not None
 
         new_linear = cls(
             in_features=linear.in_features,
             out_features=linear.out_features,
             bias=has_bias,
-            weight_hif8_max=weight_hif8_max,
-            act_hif8_max=act_hif8_max,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
         )
@@ -105,59 +79,14 @@ class HIF8QATLinear(nn.Linear):
 
         return new_linear
 
-    def _fake_quantize_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        """Apply per-channel HiF8 fake quantization to weight tensor.
-
-        Each output channel gets its own shared exponent, matching the
-        per-channel weight quantization pattern in vllm-ascend.
-
-        Args:
-            weight: High-precision weight tensor (out_features, in_features).
-
-        Returns:
-            Dequantized weight tensor simulating HiF8 precision.
-        """
-        return HIF8FakeQuantFunction.apply(
-            weight, "per_channel", self.weight_hif8_max
-        )
-
-    def _fake_quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply per-token HiF8 fake quantization to activation tensor.
-
-        Each token is quantized independently along the feature dimension,
-        matching torch_npu.npu_dynamic_quant() per-token behavior.
-
-        Args:
-            x: Activation tensor of shape (..., in_features).
-
-        Returns:
-            Dequantized activation tensor simulating HiF8 precision.
-        """
-        return HIF8FakeQuantFunction.apply(
-            x, "per_token", self.act_hif8_max
-        )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with HiF8 fake quantization.
-
-        If fake_quant_enabled is False, falls back to standard bf16 matmul.
-
-        Args:
-            x: Input activation tensor.
-
-        Returns:
-            Output tensor in bf16/fp16.
-        """
         if not self.fake_quant_enabled:
             return F.linear(x, self.weight, self.bias)
 
-        # Fake-quantize both weight and activation
-        weight_fq = self._fake_quantize_weight(self.weight)
+        # Per-element fake quant: simulate .to(hifloat8) roundtrip
+        weight_fq = HIF8FakeQuantFunction.apply(self.weight)
+        x_fq = HIF8FakeQuantFunction.apply(x)
 
-        # W8A8: always quantize activations (unlike W4A16 which skips activation quant)
-        x_fq = self._fake_quantize_activation(x)
-
-        # Compute matmul in full precision with dequantized values
         return F.linear(x_fq, weight_fq, self.bias)
 
     def extra_repr(self) -> str:

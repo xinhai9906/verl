@@ -324,18 +324,12 @@ class QATQuantizer:
         params: Iterable[tuple[str, torch.Tensor]],
         output_device: torch.device,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """HiF8 per-channel quantization: quantize weights layer-by-layer.
+        """HiF8 per-element quantization: convert weights to hifloat8, store as uint8.
 
-        For each 2D weight tensor:
-          - Compute per-channel shared exponents (one per output channel)
-          - Quantize to uint8 (offset by 128 for signed HiF8)
-          - Yield (name, weight_uint8) and (name + "_scale", scale_fp32)
-
-        scale shape: (out_features, 1) — matches vllm-ascend W8A8_DYNAMIC pattern.
+        No external scales — each element is independently quantized by the
+        HiF8 float format. uint8 is used solely as a byte-level storage
+        container for IPC compatibility.
         """
-        # HiF8 constants
-        HIF8_15_MAX = 15.0
-
         _sentinel = object()
         current_layer_idx = _sentinel
         layer_buffer: dict[str, torch.Tensor] = {}
@@ -344,7 +338,6 @@ class QATQuantizer:
             tensor_cpu = tensor.to("cpu") if tensor.is_cuda else tensor
             layer_idx = self._extract_layer_idx(name)
 
-            # Layer boundary: flush previous layer
             if layer_idx != current_layer_idx and current_layer_idx is not _sentinel and layer_buffer:
                 yield from self._process_layer_group_hif8(
                     current_layer_idx, layer_buffer, output_device
@@ -354,7 +347,6 @@ class QATQuantizer:
             current_layer_idx = layer_idx
             layer_buffer[name] = tensor_cpu
 
-        # Flush last buffered layer
         if layer_buffer:
             yield from self._process_layer_group_hif8(
                 current_layer_idx, layer_buffer, output_device
@@ -368,19 +360,13 @@ class QATQuantizer:
         layer_params: dict[str, torch.Tensor],
         output_device: torch.device,
     ) -> list[tuple[str, torch.Tensor]]:
-        """Quantize one decoder layer's weights to HiF8 format (per-channel).
+        """Quantize weights to HiF8: bf16 → hifloat8 → uint8 (byte container).
 
-        For each weight (out_features, in_features):
-          1. Per-channel shared_exp: ceil(log2(row_amax / HIF8_15_MAX))
-             → shape (out_features, 1)
-          2. Scale = 2^shared_exp
-          3. Quantize: round(weight / scale) → clamp → offset-to-uint8
-          4. Yield (name, weight_uint8) and (name + "_scale", scale_fp32)
-
-        Matches MindSpeed delayed_hif8_pertensor recipe (per-channel granularity)
-        and vllm-ascend W8A8_DYNAMIC pattern (weight_scale: out_features x 1).
+        Per-element quantization — no scale computation, no shared exponent.
+        The uint8 storage is just a byte-level container for IPC transfer;
+        vllm-ascend's process_weights_after_loading converts it back to
+        the native hifloat8 dtype on the NPU.
         """
-        HIF8_15_MAX = 15.0
         layer_weights = {}
         layer_passthrough = {}
 
@@ -400,43 +386,16 @@ class QATQuantizer:
         results = []
 
         for layer_name, (param_name, tensor) in layer_weights.items():
+            # Convert to HiF8 and back to get quantized bytes
             weight = tensor.to(device=self.device, dtype=torch.float32)
-            out_features, in_features = weight.shape
 
-            # Per-channel amax: max absolute value along in_features dim
-            # shape: (out_features, 1)
-            channel_amax = torch.amax(torch.abs(weight), dim=-1, keepdim=True)
+            # Use float8_e4m3fn as HiF8 proxy for per-element quantization
+            weight_hif8 = weight.to(torch.float8_e4m3fn)
 
-            hif8_max_tensor = torch.tensor(HIF8_15_MAX, dtype=torch.float32, device=self.device)
+            # View raw bytes as uint8 for IPC-safe transfer
+            weight_uint8 = weight_hif8.view(torch.uint8)
 
-            # Avoid log2(0)
-            safe_amax = torch.where(
-                channel_amax > 0.0,
-                channel_amax,
-                torch.tensor(1e-38, dtype=torch.float32, device=self.device),
-            )
-
-            # Per-channel shared exponent: shape (out_features, 1)
-            shared_exp = torch.ceil(
-                torch.log2(safe_amax) - torch.log2(hif8_max_tensor)
-            )
-            shared_exp = torch.clamp(shared_exp, -127, 127)
-
-            # Per-channel scale: shape (out_features, 1), broadcastable to (out_features, in_features)
-            scale = torch.pow(2.0, shared_exp.float())
-
-            # Quantize: scale down → round → clamp → offset to uint8
-            quantized = torch.round(weight / scale)
-            # Offset by 128 to map signed HiF8 values to uint8 [0, 255]
-            quantized_offset = torch.clamp(quantized + 128, 0, 255)
-            quantized_uint8 = quantized_offset.to(torch.uint8)
-
-            results.append((param_name, quantized_uint8.to(output_device)))
-
-            # Store per-channel scale as fp32
-            # Dequant: real_value = (uint8_val - 128) * scale
-            scale_name = param_name + "_scale"
-            results.append((scale_name, scale.float().to(output_device)))
+            results.append((param_name, weight_uint8.to(output_device)))
 
         # Passthrough non-quantized params
         for name, tensor in layer_passthrough.items():
