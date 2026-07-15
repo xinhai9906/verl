@@ -18,7 +18,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch.nn as nn
 
@@ -32,8 +32,8 @@ class QATConfig(BaseConfig):
     """Unified configuration for QAT (Quantization-Aware Training)."""
 
     enable: bool = False
-    mode: str = "w4a16"
-    group_size: int = 16
+    mode: str = "w4a16"  # "w4a16", "w4a4", or "w8a8_hif8"
+    group_size: int = 16  # block size for NVFP4 (not used by HiF8)
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
@@ -66,31 +66,58 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
 
     for pattern in config.ignore_patterns:
         if pattern.startswith("re:"):
-            regex = pattern[3:]
-            if re.match(regex, name):
-                logger.debug(f"Ignoring {name} due to regex pattern: {regex}")
+            if re.match(pattern[3:], name):
+                logger.debug(f"Ignoring {name} due to regex pattern: {pattern[3:]}")
                 return False
-        else:
-            if pattern in name:
-                logger.debug(f"Ignoring {name} due to pattern: {pattern}")
-                return False
+        elif pattern in name:
+            logger.debug(f"Ignoring {name} due to pattern: {pattern}")
+            return False
+
+    # HiF8 per-element: no dimension constraint
+    if config.mode == "w8a8_hif8":
+        return True
 
     if module.in_features % config.group_size != 0:
         logger.warning(
-            f"Skipping {name}: in_features={module.in_features} not divisible by group_size={config.group_size}"
+            f"Skipping {name}: in_features={module.in_features} "
+            f"not divisible by group_size={config.group_size}"
         )
         return False
 
     return True
 
 
+def _replace_modules(
+    model: nn.Module,
+    config: QATConfig,
+    factory: Callable[[nn.Linear], nn.Module],
+    target_cls: type,
+    mode_label: str,
+) -> int:
+    """Find nn.Linear layers and replace them using factory(target_cls).
+
+    Shared logic for both HiF8 and NVFP4 QAT paths — avoids code duplication.
+    """
+    modules_to_replace = [
+        (name, module)
+        for name, module in model.named_modules()
+        if _should_quantize(name, module, config) and not isinstance(module, target_cls)
+    ]
+
+    logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to {mode_label}")
+
+    for name, module in modules_to_replace:
+        _set_module(model, name, factory(module))
+
+    logger.info(f"Successfully applied {mode_label} to {len(modules_to_replace)} layers")
+    return len(modules_to_replace)
+
+
 def apply_qat(
     model: nn.Module,
     config: QATConfig | dict[str, Any],
 ) -> nn.Module:
-    """Apply QAT to a model by replacing nn.Linear with QATLinear or HIF8QATLinear."""
-    from verl.utils.qat.linear import QATLinear, QATMode
-
+    """Apply QAT to a model by replacing nn.Linear with quantized variants."""
     if not isinstance(config, QATConfig):
         config = QATConfig(**config)
 
@@ -98,58 +125,38 @@ def apply_qat(
         logger.info("QAT is disabled, returning original model")
         return model
 
-    # Check for HiF8 mode
-    is_hif8 = config.mode == "w8a8_hif8"
-
-    if is_hif8:
+    if config.mode == "w8a8_hif8":
         from verl.utils.qat.linear import HIF8QATLinear
 
         logger.info("Applying QAT with mode=w8a8_hif8 (per-element, native HiF8)")
-
-        modules_to_replace = []
-        for name, module in model.named_modules():
-            if _should_quantize(name, module, config):
-                modules_to_replace.append((name, module))
-
-        logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to HIF8 QAT")
-
-        converted_count = 0
-        for name, module in modules_to_replace:
-            if isinstance(module, HIF8QATLinear):
-                continue
-            _set_module(model, name, HIF8QATLinear.from_linear(module))
-            converted_count += 1
-
-        logger.info(f"Successfully applied HIF8 QAT to {converted_count} layers")
+        _replace_modules(
+            model, config,
+            factory=HIF8QATLinear.from_linear,
+            target_cls=HIF8QATLinear,
+            mode_label="HiF8 QAT",
+        )
         return model
 
     # Standard NVFP4 QAT path
+    from verl.utils.qat.linear import QATLinear, QATMode
+
     mode = QATMode(config.mode.lower())
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
 
-    modules_to_replace = []
-    for name, module in model.named_modules():
-        if _should_quantize(name, module, config):
-            modules_to_replace.append((name, module))
-
-    logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to QAT")
-
-    converted_count = 0
-    for name, module in modules_to_replace:
-        if isinstance(module, QATLinear):
-            continue
-
-        fake_quant_module = QATLinear.from_linear(
-            module,
+    def _factory(linear: nn.Linear) -> QATLinear:
+        return QATLinear.from_linear(
+            linear,
             mode=mode,
             group_size=config.group_size,
             activation_observer=config.activation_observer,
         )
 
-        _set_module(model, name, fake_quant_module)
-        converted_count += 1
-
-    logger.info(f"Successfully applied QAT to {converted_count} layers")
+    _replace_modules(
+        model, config,
+        factory=_factory,
+        target_cls=QATLinear,
+        mode_label=f"QAT ({mode.value})",
+    )
 
     return model
 
@@ -170,7 +177,7 @@ FUSION_PATTERNS = {
 
 
 def setup_fusion_siblings(model: nn.Module):
-    """Setup fusion siblings for QKV and GateUp layers."""
+    """Setup fusion siblings for NVFP4 QKV and GateUp layers."""
     import weakref
 
     from verl.utils.qat.linear import QATLinear
@@ -201,14 +208,14 @@ def setup_fusion_siblings(model: nn.Module):
 
 
 def enable_qat_fuse(model: nn.Module):
-    """Enable QAT fuse mode: sets up fusion siblings for weight scale fusion."""
+    """Enable QAT fuse mode for NVFP4 weight scale fusion."""
     setup_fusion_siblings(model)
     model._qat_fuse_enabled = True
     logger.info("[QAT Fuse] Enabled QAT fuse mode")
 
 
 def invalidate_all_scales(model: nn.Module):
-    """Clear all cached weight scales after optimizer.step()."""
+    """Clear all cached NVFP4 weight scales after optimizer.step()."""
     from verl.utils.qat.linear import QATLinear
 
     count = 0
