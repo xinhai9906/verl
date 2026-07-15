@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""QAT FakeQuantized Linear module for NVFP4 (W4A4/W4A16) with FSDP compatibility.
+"""QAT FakeQuantized Linear modules for FSDP compatibility.
 
-Includes Triton kernels for high-performance FP4 quantization.
+Supports:
+  - NVFP4 (W4A4/W4A16): via Triton-based blockwise fake quantization
+  - HiF8 (W8A8): per-element native HiF8 quantization (no external scales)
 """
 
 from enum import Enum
@@ -24,7 +26,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["QATLinear", "QATMode"]
+__all__ = [
+    "QATLinear", "QATMode",
+    "HIF8QATLinear",
+    "HIF8FakeQuantFunction", "hif8_per_element_fake_quantize",
+]
 
 
 import triton
@@ -382,4 +388,105 @@ class QATLinear(nn.Linear):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, mode={self.mode.value}, "
             f"group_size={self.group_size}, fake_quant_enabled={self.fake_quant_enabled}"
+        )
+
+
+# ============================================================================
+# HiF8 Per-Element Quantization
+# ============================================================================
+# HiF8 is Huawei Ascend's native 8-bit float. Per-element: each value is
+# independently quantized via dtype conversion — no external scales.
+# ============================================================================
+
+
+def _get_hif8_dtype() -> torch.dtype:
+    """Get the native HiF8 dtype from torch_npu, fall back to float8_e4m3fn."""
+    try:
+        import torch_npu
+        hifloat8 = getattr(torch_npu, "hifloat8", None)
+        if hifloat8 is not None:
+            return hifloat8
+    except ImportError:
+        pass
+    return torch.float8_e4m3fn
+
+
+def hif8_per_element_fake_quantize(tensor: torch.Tensor) -> torch.Tensor:
+    """Per-element HiF8 fake quant: simulate .to(hifloat8).to(original_dtype).
+
+    Each element independently quantized — no shared exponent, no scale.
+    Uses real torch_npu.hifloat8 if available, else float8_e4m3fn proxy.
+    """
+    original_dtype = tensor.dtype
+    return tensor.to(_get_hif8_dtype()).to(original_dtype)
+
+
+class HIF8FakeQuantFunction(torch.autograd.Function):
+    """STE for per-element HiF8 fake quantization.
+
+    Forward:  x → .to(hifloat8) → .to(original_dtype)
+    Backward: gradient passes through unchanged.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        return hif8_per_element_fake_quantize(tensor)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        return grad_output,
+
+
+class HIF8QATLinear(nn.Linear):
+    """W8A8 HiF8 FakeQuantized Linear — per-element, native HiF8 quantization.
+
+    Forward:
+        weight_fq = weight.to(hifloat8).to(bf16)  — per-element fake quant
+        x_fq      = x.to(hifloat8).to(bf16)       — per-element fake quant
+        output    = x_fq @ weight_fq^T + bias
+
+    No external scales or blocks. FSDP-compatible (standard nn.Parameter).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
+        self.fake_quant_enabled: bool = True
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear) -> "HIF8QATLinear":
+        """Create HIF8QATLinear from an existing nn.Linear, copying weights."""
+        has_bias = linear.bias is not None
+        new_linear = cls(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            bias=has_bias,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+        if linear.weight.device != torch.device("meta"):
+            new_linear.weight = nn.Parameter(linear.weight.clone())
+            if has_bias:
+                new_linear.bias = nn.Parameter(linear.bias.clone())
+        return new_linear
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.fake_quant_enabled:
+            return F.linear(x, self.weight, self.bias)
+
+        weight_fq = HIF8FakeQuantFunction.apply(self.weight)
+        x_fq = HIF8FakeQuantFunction.apply(x)
+        return F.linear(x_fq, weight_fq, self.bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, "
+            f"fake_quant_enabled={self.fake_quant_enabled}"
         )

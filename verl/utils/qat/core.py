@@ -102,7 +102,7 @@ def apply_qat(
     is_hif8 = config.mode == "w8a8_hif8"
 
     if is_hif8:
-        from verl.utils.qat.hif8_linear import HIF8QATLinear
+        from verl.utils.qat.linear import HIF8QATLinear
 
         logger.info("Applying QAT with mode=w8a8_hif8 (per-element, native HiF8)")
 
