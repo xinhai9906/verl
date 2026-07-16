@@ -396,6 +396,15 @@ class QATLinear(nn.Linear):
 # ============================================================================
 # HiF8 is Huawei Ascend's native 8-bit float. Per-element: each value is
 # independently quantized via dtype conversion — no external scales.
+#
+# Two HiF8 variants (matching MindSpeed FormatEnum):
+#   HIF8_15  (max=15):  forward weights and activations
+#   HIF8_224 (max=224): backward gradients
+#
+# In per-element native mode, the dtype itself defines the representable
+# range, so the two variants are distinguished at the hardware level.
+# Our software simulation uses float8_e4m3fn (max=448) as a proxy that
+# covers both ranges.
 # ============================================================================
 
 
@@ -422,10 +431,12 @@ def hif8_per_element_fake_quantize(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
-    """STE for per-element HiF8 fake quantization.
+    """Full HiF8 QAT: quantize both forward activations/weights AND backward gradients.
 
-    Forward:  x → .to(hifloat8) → .to(original_dtype)
-    Backward: gradient passes through unchanged.
+    Forward:  x → .to(hifloat8) → .to(original_dtype)   (simulate HiF8 precision)
+    Backward: grad → .to(hifloat8) → .to(original_dtype) (quantize gradients too)
+
+    Both paths use per-element native conversion — no external scales.
     """
 
     @staticmethod
@@ -433,8 +444,9 @@ class HIF8FakeQuantFunction(torch.autograd.Function):
         return hif8_per_element_fake_quantize(tensor)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple:
-        return grad_output,
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        # Quantize gradient: matches MindSpeed HIF8_224 for backward
+        return hif8_per_element_fake_quantize(grad_output),
 
 
 class HIF8QATLinear(nn.Linear):

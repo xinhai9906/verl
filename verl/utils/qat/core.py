@@ -66,12 +66,14 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
 
     for pattern in config.ignore_patterns:
         if pattern.startswith("re:"):
-            if re.match(pattern[3:], name):
-                logger.debug(f"Ignoring {name} due to regex pattern: {pattern[3:]}")
+            regex = pattern[3:]
+            if re.match(regex, name):
+                logger.debug(f"Ignoring {name} due to regex pattern: {regex}")
                 return False
-        elif pattern in name:
-            logger.debug(f"Ignoring {name} due to pattern: {pattern}")
-            return False
+        else:
+            if pattern in name:
+                logger.debug(f"Ignoring {name} due to pattern: {pattern}")
+                return False
 
     # HiF8 per-element: no dimension constraint
     if config.mode == "w8a8_hif8":
@@ -79,8 +81,7 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
 
     if module.in_features % config.group_size != 0:
         logger.warning(
-            f"Skipping {name}: in_features={module.in_features} "
-            f"not divisible by group_size={config.group_size}"
+            f"Skipping {name}: in_features={module.in_features} not divisible by group_size={config.group_size}"
         )
         return False
 
