@@ -381,8 +381,7 @@ class QATQuantizer:
 
         for layer_name, (param_name, tensor) in layer_weights.items():
             # Per-element HiF8 quantization: bf16 → hifloat8 → uint8
-            weight = tensor.to(device=self.device, dtype=torch.float32)
-            weight_hif8 = weight.to(torch_npu.hifloat8)
+            weight_hif8 = tensor.to(device=self.device, dtype=torch_npu.hifloat8)
             weight_uint8 = weight_hif8.view(torch.uint8)
 
             results.append((param_name, weight_uint8.to(output_device)))
