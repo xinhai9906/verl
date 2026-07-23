@@ -23,6 +23,7 @@ from enum import Enum
 from typing import Optional
 
 import torch
+import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -401,33 +402,18 @@ class QATLinear(nn.Linear):
 #   HIF8_15  (max=15):  forward weights and activations
 #   HIF8_224 (max=224): backward gradients
 #
-# In per-element native mode, the dtype itself defines the representable
-# range, so the two variants are distinguished at the hardware level.
-# Our software simulation uses float8_e4m3fn (max=448) as a proxy that
-# covers both ranges.
+# In per-element native mode, the hifloat8 dtype itself defines the
+# representable range. HIF8_15/HIF8_224 are handled at the hardware level.
 # ============================================================================
-
-
-def _get_hif8_dtype() -> torch.dtype:
-    """Get the native HiF8 dtype from torch_npu, fall back to float8_e4m3fn."""
-    try:
-        import torch_npu
-        hifloat8 = getattr(torch_npu, "hifloat8", None)
-        if hifloat8 is not None:
-            return hifloat8
-    except ImportError:
-        pass
-    return torch.float8_e4m3fn
 
 
 def hif8_per_element_fake_quantize(tensor: torch.Tensor) -> torch.Tensor:
     """Per-element HiF8 fake quant: simulate .to(hifloat8).to(original_dtype).
 
     Each element independently quantized — no shared exponent, no scale.
-    Uses real torch_npu.hifloat8 if available, else float8_e4m3fn proxy.
     """
     original_dtype = tensor.dtype
-    return tensor.to(_get_hif8_dtype()).to(original_dtype)
+    return tensor.to(torch_npu.hifloat8).to(original_dtype)
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):

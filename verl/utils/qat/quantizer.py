@@ -25,6 +25,7 @@ import re
 from typing import Generator, Iterable, Optional
 
 import torch
+import torch_npu
 from compressed_tensors.compressors.quantized_compressors.fp4_quantized import NVFP4PackedCompressor
 from compressed_tensors.quantization.quant_args import (
     FP4_E2M1_DATA,
@@ -322,12 +323,7 @@ class QATQuantizer:
         params: Iterable[tuple[str, torch.Tensor]],
         output_device: torch.device,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """HiF8 per-element quantization: convert weights to hifloat8, store as uint8.
-
-        No external scales — each element is independently quantized by the
-        HiF8 float format. uint8 is used solely as a byte-level storage
-        container for IPC compatibility.
-        """
+        """HiF8 per-element quantization: bf16 → hifloat8 → uint8 (no scales)."""
         _sentinel = object()
         current_layer_idx = _sentinel
         layer_buffer: dict[str, torch.Tensor] = {}
@@ -337,7 +333,7 @@ class QATQuantizer:
             layer_idx = self._extract_layer_idx(name)
 
             if layer_idx != current_layer_idx and current_layer_idx is not _sentinel and layer_buffer:
-                yield from self._process_layer_group_hif8(
+                yield from self._process_layer_hif8(
                     current_layer_idx, layer_buffer, output_device
                 )
                 layer_buffer = {}
@@ -346,13 +342,13 @@ class QATQuantizer:
             layer_buffer[name] = tensor_cpu
 
         if layer_buffer:
-            yield from self._process_layer_group_hif8(
+            yield from self._process_layer_hif8(
                 current_layer_idx, layer_buffer, output_device
             )
 
         get_torch_device().empty_cache()
 
-    def _process_layer_group_hif8(
+    def _process_layer_hif8(
         self,
         layer_idx: Optional[int],
         layer_params: dict[str, torch.Tensor],
@@ -384,13 +380,9 @@ class QATQuantizer:
         results = []
 
         for layer_name, (param_name, tensor) in layer_weights.items():
-            # Convert to HiF8 and back to get quantized bytes
+            # Per-element HiF8 quantization: bf16 → hifloat8 → uint8
             weight = tensor.to(device=self.device, dtype=torch.float32)
-
-            # Use float8_e4m3fn as HiF8 proxy for per-element quantization
-            weight_hif8 = weight.to(torch.float8_e4m3fn)
-
-            # View raw bytes as uint8 for IPC-safe transfer
+            weight_hif8 = weight.to(torch_npu.hifloat8)
             weight_uint8 = weight_hif8.view(torch.uint8)
 
             results.append((param_name, weight_uint8.to(output_device)))

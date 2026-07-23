@@ -1,0 +1,4 @@
+{
+  "quant_method": "ascend-hif8",
+  "ignore": ["lm_head", "embed_tokens"]
+}
