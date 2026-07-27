@@ -75,7 +75,7 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
                 logger.debug(f"Ignoring {name} due to pattern: {pattern}")
                 return False
 
-    # HiF8 per-element weight-only: no dimension constraint
+    # HiF8 per-tensor weight-only: no dimension constraint
     if config.mode == "w8_hif8":
         return True
 
@@ -129,7 +129,7 @@ def apply_qat(
     if config.mode == "w8_hif8":
         from verl.utils.qat.linear import HIF8QATLinear
 
-        logger.info("Applying QAT with mode=w8_hif8 (weight-only, per-element native HiF8)")
+        logger.info("Applying QAT with mode=w8_hif8 (weight-only, per-tensor native HiF8)")
         _replace_modules(
             model, config,
             factory=HIF8QATLinear.from_linear,

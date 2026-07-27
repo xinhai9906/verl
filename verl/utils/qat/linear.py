@@ -16,7 +16,7 @@
 
 Supports:
   - NVFP4 (W4A4/W4A16): via Triton-based blockwise fake quantization
-  - HiF8 (W8A8): per-element native HiF8 quantization (no external scales)
+  - HiF8 (W8): per-tensor weight-only quantization (shared exponent, dynamic scale)
 """
 
 from enum import Enum
@@ -29,7 +29,7 @@ import torch.nn.functional as F
 __all__ = [
     "QATLinear", "QATMode",
     "HIF8QATLinear", "HIF8FakeQuantFunction",
-    "hif8_fake_quant_weight", "hif8_fake_quant_activation",
+    "hif8_fake_quant_weight", "hif8_fake_quant_gradient",
 ]
 
 
@@ -398,8 +398,8 @@ class QATLinear(nn.Linear):
 #
 # Granularity (matching MindSpeed delayed_hif8_pertensor):
 #   Weight:      per-tensor  — one shared exponent for the whole weight tensor
-#   Activation:  per-token   — one shared exponent per token (dynamic)
-#   Gradient:    per-tensor  — one shared exponent for the whole gradient
+#   Activation:  not quantized (W8, weight-only QAT)
+#   Gradient:    per-tensor  — one shared exponent (HIF8_224)
 #
 # Shared exponent formula:
 #   shared_exp = ceil(log2(amax / hif8_max))
@@ -444,33 +444,19 @@ def hif8_fake_quant_weight(weight: torch.Tensor) -> torch.Tensor:
     return _hif8_fake_quant(weight, reduce_dim=None, hif8_max=HIF8_15_MAX)
 
 
-def hif8_fake_quant_activation(x: torch.Tensor) -> torch.Tensor:
-    """Per-token HiF8 fake quant: one shared exponent per token (last dim)."""
-    return _hif8_fake_quant(x, reduce_dim=-1, hif8_max=HIF8_15_MAX)
-
-
 def hif8_fake_quant_gradient(grad: torch.Tensor) -> torch.Tensor:
     """Per-tensor HiF8 fake quant for gradients (HIF8_224 max)."""
     return _hif8_fake_quant(grad, reduce_dim=None, hif8_max=HIF8_224_MAX)
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
-    """Full HiF8 QAT: per-tensor weight & gradient, per-token activation.
-
-    Forward:  weight → per-tensor fake quant (HIF8_15)
-             x → per-token fake quant (HIF8_15)
-    Backward: grad → per-tensor fake quant (HIF8_224)
+    """W8 HiF8 QAT: per-tensor weight fake quant (HIF8_15).
+    Backward: per-tensor gradient fake quant (HIF8_224).
     """
 
     @staticmethod
-    def forward(ctx, tensor: torch.Tensor, mode: str = "weight") -> torch.Tensor:
-        ctx.mode = mode
-        if mode == "weight":
-            return hif8_fake_quant_weight(tensor)
-        elif mode == "activation":
-            return hif8_fake_quant_activation(tensor)
-        else:
-            return hif8_fake_quant_weight(tensor)
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        return hif8_fake_quant_weight(tensor)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
@@ -519,7 +505,7 @@ class HIF8QATLinear(nn.Linear):
         if not self.fake_quant_enabled:
             return F.linear(x, self.weight, self.bias)
 
-        weight_fq = HIF8FakeQuantFunction.apply(self.weight, "weight")
+        weight_fq = HIF8FakeQuantFunction.apply(self.weight)
         return F.linear(x, weight_fq, self.bias)
 
     def extra_repr(self) -> str:

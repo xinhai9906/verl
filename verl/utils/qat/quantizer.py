@@ -123,7 +123,7 @@ class QATQuantizer:
 
     Supports:
       - w4a16 / w4a4: NVFP4 quantization via compressed_tensors
-      - w8_hif8: HiF8 per-element weight-only quantization (no scales)
+      - w8_hif8: HiF8 per-tensor weight-only quantization (no scales)
     """
 
     def __init__(
@@ -136,7 +136,7 @@ class QATQuantizer:
     ):
         self.mode = mode.lower()
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
-        self._is_hif8 = self.mode == "w8_hif8"  # W8 HiF8 weight-only per-element mode
+        self._is_hif8 = self.mode == "w8_hif8"  # W8 HiF8 weight-only per-tensor mode
         self.group_size = group_size
         self.ignore_patterns = ignore_patterns or ["lm_head", "embed_tokens", "re:.*mlp.gate$"]
         self.device = device or torch.device(get_device_name())
@@ -161,7 +161,7 @@ class QATQuantizer:
         if tensor.dim() != 2:
             return False
 
-        # HiF8 per-element: no dimension constraint on in_features
+        # HiF8 per-tensor: no dimension constraint on in_features
         if not self._is_hif8 and tensor.shape[1] % self.group_size != 0:
             return False
 
