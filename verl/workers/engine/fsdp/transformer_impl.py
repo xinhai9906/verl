@@ -523,7 +523,7 @@ class FSDPEngine(BaseEngine):
                 "activation_observer": self._qat_config.activation_observer,
             },
         )
-        if self._qat_config.mode != "w8a8_hif8":
+        if self._qat_config.mode != "w8_hif8":
             enable_qat_fuse(module)
 
         if self._qat_config.mode == "w4a4":

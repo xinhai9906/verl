@@ -32,7 +32,7 @@ class QATConfig(BaseConfig):
     """Unified configuration for QAT (Quantization-Aware Training)."""
 
     enable: bool = False
-    mode: str = "w4a16"  # "w4a16", "w4a4", or "w8a8_hif8"
+    mode: str = "w4a16"  # "w4a16", "w4a4", or "w8_hif8"
     group_size: int = 16  # block size for NVFP4 (not used by HiF8)
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
@@ -75,8 +75,8 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
                 logger.debug(f"Ignoring {name} due to pattern: {pattern}")
                 return False
 
-    # HiF8 per-element: no dimension constraint
-    if config.mode == "w8a8_hif8":
+    # HiF8 per-element weight-only: no dimension constraint
+    if config.mode == "w8_hif8":
         return True
 
     if module.in_features % config.group_size != 0:
@@ -126,10 +126,10 @@ def apply_qat(
         logger.info("QAT is disabled, returning original model")
         return model
 
-    if config.mode == "w8a8_hif8":
+    if config.mode == "w8_hif8":
         from verl.utils.qat.linear import HIF8QATLinear
 
-        logger.info("Applying QAT with mode=w8a8_hif8 (per-element, native HiF8)")
+        logger.info("Applying QAT with mode=w8_hif8 (weight-only, per-element native HiF8)")
         _replace_modules(
             model, config,
             factory=HIF8QATLinear.from_linear,

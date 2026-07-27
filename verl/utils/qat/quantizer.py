@@ -25,7 +25,6 @@ import re
 from typing import Generator, Iterable, Optional
 
 import torch
-import torch_npu
 from compressed_tensors.compressors.quantized_compressors.fp4_quantized import NVFP4PackedCompressor
 from compressed_tensors.quantization.quant_args import (
     FP4_E2M1_DATA,
@@ -124,7 +123,7 @@ class QATQuantizer:
 
     Supports:
       - w4a16 / w4a4: NVFP4 quantization via compressed_tensors
-      - w8a8_hif8: HiF8 per-element quantization (no scales)
+      - w8_hif8: HiF8 per-element weight-only quantization (no scales)
     """
 
     def __init__(
@@ -137,7 +136,7 @@ class QATQuantizer:
     ):
         self.mode = mode.lower()
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
-        self._is_hif8 = self.mode == "w8a8_hif8"  # W8A8 HiF8 per-element mode
+        self._is_hif8 = self.mode == "w8_hif8"  # W8 HiF8 weight-only per-element mode
         self.group_size = group_size
         self.ignore_patterns = ignore_patterns or ["lm_head", "embed_tokens", "re:.*mlp.gate$"]
         self.device = device or torch.device(get_device_name())
@@ -281,7 +280,7 @@ class QATQuantizer:
 
         output_device = target_device or torch.device("cpu")
 
-        # Dispatch to HiF8 path for w8a8_hif8 mode
+        # Dispatch to HiF8 path for w8_hif8 mode
         if self._is_hif8:
             yield from self._quantize_with_fusion_hif8(params, output_device)
             return
@@ -323,7 +322,7 @@ class QATQuantizer:
         params: Iterable[tuple[str, torch.Tensor]],
         output_device: torch.device,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """HiF8 per-element quantization: bf16 → hifloat8 → uint8 (no scales)."""
+        """HiF8 per-tensor quantization: bf16 → uint8 + per-tensor scale."""
         _sentinel = object()
         current_layer_idx = _sentinel
         layer_buffer: dict[str, torch.Tensor] = {}
@@ -354,13 +353,18 @@ class QATQuantizer:
         layer_params: dict[str, torch.Tensor],
         output_device: torch.device,
     ) -> list[tuple[str, torch.Tensor]]:
-        """Quantize weights to HiF8: bf16 → hifloat8 → uint8 (byte container).
+        """Quantize weights to HiF8 (per-tensor): bf16 → uint8 + fp32 scale.
 
-        Per-element quantization — no scale computation, no shared exponent.
-        The uint8 storage is just a byte-level container for IPC transfer;
-        vllm-ascend's process_weights_after_loading converts it back to
-        the native hifloat8 dtype on the NPU.
+        Per-tensor shared exponent (one per weight tensor):
+          amax = max(|weight|)
+          shared_exp = ceil(log2(amax / 15.0))
+          scale = 2^shared_exp
+          weight_q = clamp(round(weight / scale), -15, 15)
+          weight_uint8 = (weight_q + 128) as uint8
+
+        Yields (name, weight_uint8) and (name + "_scale", scale_fp32).
         """
+        HIF8_15 = 15.0
         layer_weights = {}
         layer_passthrough = {}
 
@@ -380,13 +384,27 @@ class QATQuantizer:
         results = []
 
         for layer_name, (param_name, tensor) in layer_weights.items():
-            # Per-element HiF8 quantization: bf16 → hifloat8 → uint8
-            weight_hif8 = tensor.to(device=self.device, dtype=torch_npu.hifloat8)
-            weight_uint8 = weight_hif8.view(torch.uint8)
+            weight = tensor.to(device=self.device, dtype=torch.float32)
+
+            # Per-tensor shared exponent
+            amax = weight.abs().max()
+            hif8_max_t = torch.tensor(HIF8_15, dtype=torch.float32, device=self.device)
+            safe_amax = amax if amax > 0 else torch.tensor(1e-38, device=self.device)
+            shared_exp = torch.clamp(
+                torch.ceil(torch.log2(safe_amax) - torch.log2(hif8_max_t)),
+                -127.0, 127.0
+            )
+            scale = torch.pow(2.0, shared_exp)  # scalar
+
+            # Quantize: scale down → round → clamp → offset to uint8
+            q = torch.round(weight / scale)
+            q = torch.clamp(q, -HIF8_15, HIF8_15)
+            weight_uint8 = (q + 128).clamp(0, 255).to(torch.uint8)
 
             results.append((param_name, weight_uint8.to(output_device)))
+            # Per-tensor scale: scalar fp32
+            results.append((param_name + "_scale", scale.float().reshape(1).to(output_device)))
 
-        # Passthrough non-quantized params
         for name, tensor in layer_passthrough.items():
             results.append((name, tensor.to(output_device)))
 

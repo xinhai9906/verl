@@ -23,14 +23,13 @@ from enum import Enum
 from typing import Optional
 
 import torch
-import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 
 __all__ = [
     "QATLinear", "QATMode",
-    "HIF8QATLinear",
-    "HIF8FakeQuantFunction", "hif8_per_element_fake_quantize",
+    "HIF8QATLinear", "HIF8FakeQuantFunction",
+    "hif8_fake_quant_weight", "hif8_fake_quant_activation",
 ]
 
 
@@ -393,57 +392,99 @@ class QATLinear(nn.Linear):
 
 
 # ============================================================================
-# HiF8 Per-Element Quantization
+# HiF8 Per-Tensor Quantization
 # ============================================================================
-# HiF8 is Huawei Ascend's native 8-bit float. Per-element: each value is
-# independently quantized via dtype conversion — no external scales.
+# HiF8 is Huawei Ascend's native 8-bit float format.
 #
-# Two HiF8 variants (matching MindSpeed FormatEnum):
-#   HIF8_15  (max=15):  forward weights and activations
-#   HIF8_224 (max=224): backward gradients
+# Granularity (matching MindSpeed delayed_hif8_pertensor):
+#   Weight:      per-tensor  — one shared exponent for the whole weight tensor
+#   Activation:  per-token   — one shared exponent per token (dynamic)
+#   Gradient:    per-tensor  — one shared exponent for the whole gradient
 #
-# In per-element native mode, the hifloat8 dtype itself defines the
-# representable range. HIF8_15/HIF8_224 are handled at the hardware level.
+# Shared exponent formula:
+#   shared_exp = ceil(log2(amax / hif8_max))
+#   scale = 2^shared_exp
+#   quantized = round(x / scale), clamped to [-hif8_max, hif8_max]
+#   dequantized = quantized * scale
+#
+# Two HiF8 variants:
+#   HIF8_15  (max=15):   forward weights and activations
+#   HIF8_224 (max=224):  backward gradients
 # ============================================================================
 
+HIF8_15_MAX: float = 15.0
+HIF8_224_MAX: float = 224.0
+_FP32_MIN_NORMAL: float = 2.0**-126
 
-def hif8_per_element_fake_quantize(tensor: torch.Tensor) -> torch.Tensor:
-    """Per-element HiF8 fake quant: simulate .to(hifloat8).to(original_dtype).
 
-    Each element independently quantized — no shared exponent, no scale.
-    """
-    original_dtype = tensor.dtype
-    return tensor.to(torch_npu.hifloat8).to(original_dtype)
+def _compute_shared_exp(amax: torch.Tensor, hif8_max: float) -> torch.Tensor:
+    """shared_exp = clamp(ceil(log2(amax / hif8_max)), -127, 127)"""
+    hif8_max_t = torch.tensor(hif8_max, dtype=torch.float32, device=amax.device)
+    safe = torch.where(amax > 0, amax, torch.tensor(_FP32_MIN_NORMAL, device=amax.device))
+    return torch.clamp(torch.ceil(torch.log2(safe) - torch.log2(hif8_max_t)), -127.0, 127.0)
+
+
+def _fake_quant_by_scale(tensor: torch.Tensor, scale: torch.Tensor, hif8_max: float) -> torch.Tensor:
+    """Apply scale, round, clamp, dequantize: round(x/scale) * scale"""
+    q = torch.round(tensor.float() / scale)
+    q = torch.clamp(q, -hif8_max, hif8_max)
+    return (q * scale).to(tensor.dtype)
+
+
+def _hif8_fake_quant(tensor: torch.Tensor, reduce_dim: int, hif8_max: float) -> torch.Tensor:
+    """Core HiF8 fake quant: compute shared_exp along reduce_dim, apply, dequantize."""
+    amax = torch.amax(torch.abs(tensor.float()), dim=reduce_dim, keepdim=True)
+    shared_exp = _compute_shared_exp(amax, hif8_max)
+    scale = torch.pow(2.0, shared_exp)  # broadcastable to tensor shape
+    return _fake_quant_by_scale(tensor, scale, hif8_max)
+
+
+def hif8_fake_quant_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Per-tensor HiF8 fake quant: one shared exponent for the whole weight."""
+    return _hif8_fake_quant(weight, reduce_dim=None, hif8_max=HIF8_15_MAX)
+
+
+def hif8_fake_quant_activation(x: torch.Tensor) -> torch.Tensor:
+    """Per-token HiF8 fake quant: one shared exponent per token (last dim)."""
+    return _hif8_fake_quant(x, reduce_dim=-1, hif8_max=HIF8_15_MAX)
+
+
+def hif8_fake_quant_gradient(grad: torch.Tensor) -> torch.Tensor:
+    """Per-tensor HiF8 fake quant for gradients (HIF8_224 max)."""
+    return _hif8_fake_quant(grad, reduce_dim=None, hif8_max=HIF8_224_MAX)
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
-    """Full HiF8 QAT: quantize both forward activations/weights AND backward gradients.
+    """Full HiF8 QAT: per-tensor weight & gradient, per-token activation.
 
-    Forward:  x → .to(hifloat8) → .to(original_dtype)   (simulate HiF8 precision)
-    Backward: grad → .to(hifloat8) → .to(original_dtype) (quantize gradients too)
-
-    Both paths use per-element native conversion — no external scales.
+    Forward:  weight → per-tensor fake quant (HIF8_15)
+             x → per-token fake quant (HIF8_15)
+    Backward: grad → per-tensor fake quant (HIF8_224)
     """
 
     @staticmethod
-    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
-        return hif8_per_element_fake_quantize(tensor)
+    def forward(ctx, tensor: torch.Tensor, mode: str = "weight") -> torch.Tensor:
+        ctx.mode = mode
+        if mode == "weight":
+            return hif8_fake_quant_weight(tensor)
+        elif mode == "activation":
+            return hif8_fake_quant_activation(tensor)
+        else:
+            return hif8_fake_quant_weight(tensor)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
-        # Quantize gradient: matches MindSpeed HIF8_224 for backward
-        return hif8_per_element_fake_quantize(grad_output),
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        return hif8_fake_quant_gradient(grad_output), None
 
 
 class HIF8QATLinear(nn.Linear):
-    """W8A8 HiF8 FakeQuantized Linear — per-element, native HiF8 quantization.
+    """W8 HiF8 FakeQuantized Linear — weight-only, per-tensor.
 
     Forward:
-        weight_fq = weight.to(hifloat8).to(bf16)  — per-element fake quant
-        x_fq      = x.to(hifloat8).to(bf16)       — per-element fake quant
-        output    = x_fq @ weight_fq^T + bias
+        weight_fq = per-tensor fake quant (one shared_exp for whole weight)
+        output = x @ weight_fq^T + bias  (activation unchanged, bf16)
 
-    No external scales or blocks. FSDP-compatible (standard nn.Parameter).
+    FSDP-compatible (standard nn.Parameter).
     """
 
     def __init__(
@@ -478,9 +519,8 @@ class HIF8QATLinear(nn.Linear):
         if not self.fake_quant_enabled:
             return F.linear(x, self.weight, self.bias)
 
-        weight_fq = HIF8FakeQuantFunction.apply(self.weight)
-        x_fq = HIF8FakeQuantFunction.apply(x)
-        return F.linear(x_fq, weight_fq, self.bias)
+        weight_fq = HIF8FakeQuantFunction.apply(self.weight, "weight")
+        return F.linear(x, weight_fq, self.bias)
 
     def extra_repr(self) -> str:
         return (
