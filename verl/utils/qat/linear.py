@@ -400,7 +400,7 @@ class QATLinear(nn.Linear):
 #
 # QAT approach:
 #   Weight:    tensorwise scaled — scale computed fresh each forward
-#   Gradient:  tensorwise scaled — same scale from forward reused
+#   Gradient:  tensorwise scaled — own scale computed from grad
 #   Activation: not quantized (W8, weight-only QAT)
 #
 # Tensorwise Scaling: scale = amax / 49152, computed online every forward.
@@ -430,19 +430,18 @@ def hif8_native_fake_quant(tensor: torch.Tensor, scale: torch.Tensor) -> torch.T
 class HIF8FakeQuantFunction(torch.autograd.Function):
     """W8 HiF8 QAT: tensorwise scale → per-tensor native HiF8 roundtrip.
 
-    Forward:  scale = amax/49152,  quantize → dequantize
-    Backward: reuse forward's scale, quantize gradient same way
+    Forward:  scale = amax/49152 (from weight), quantize → dequantize
+    Backward: scale = amax/49152 (from grad, independent), quantize same way
     """
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
         scale = _hif8_scale_from_tensor(tensor)
-        ctx.save_for_backward(scale)
         return hif8_native_fake_quant(tensor, scale).to(tensor.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
-        (scale,) = ctx.saved_tensors
+        scale = _hif8_scale_from_tensor(grad_output)
         grad_quant = hif8_native_fake_quant(grad_output, scale)
         return grad_quant.to(grad_output.dtype),
 
