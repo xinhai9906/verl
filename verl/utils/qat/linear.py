@@ -468,7 +468,6 @@ class HIF8QATLinear(nn.Linear):
         dtype: Optional[torch.dtype] = None,
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
-        self.fake_quant_enabled: bool = True
 
     @classmethod
     def from_linear(cls, linear: nn.Linear) -> "HIF8QATLinear":
@@ -488,15 +487,5 @@ class HIF8QATLinear(nn.Linear):
         return new_linear
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.fake_quant_enabled:
-            return F.linear(x, self.weight, self.bias)
-
         weight_fq = HIF8FakeQuantFunction.apply(self.weight)
         return F.linear(x, weight_fq, self.bias)
-
-    def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, "
-            f"fake_quant_enabled={self.fake_quant_enabled}"
-        )
