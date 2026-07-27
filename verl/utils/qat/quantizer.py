@@ -25,6 +25,7 @@ import re
 from typing import Generator, Iterable, Optional
 
 import torch
+import torch_npu
 from compressed_tensors.compressors.quantized_compressors.fp4_quantized import NVFP4PackedCompressor
 from compressed_tensors.quantization.quant_args import (
     FP4_E2M1_DATA,
@@ -359,9 +360,9 @@ class QATQuantizer:
           amax = max(|weight|)
           shared_exp = ceil(log2(amax / 15.0))
           scale = 2^shared_exp
-          weight_q = clamp(round(weight / scale), -15, 15)
-          weight_uint8 = (weight_q + 128) as uint8
+          weight_q = clamp(round(weight / scale), -15, 15) → hifloat8 → uint8
 
+        uint8 is just the byte container for hifloat8 values (IPC-compatible).
         Yields (name, weight_uint8) and (name + "_scale", scale_fp32).
         """
         HIF8_15 = 15.0
@@ -396,10 +397,10 @@ class QATQuantizer:
             )
             scale = torch.pow(2.0, shared_exp)  # scalar
 
-            # Quantize: scale down → round → clamp → offset to uint8
+            # Quantize: scale down → round → clamp → hifloat8 → uint8
             q = torch.round(weight / scale)
             q = torch.clamp(q, -HIF8_15, HIF8_15)
-            weight_uint8 = (q + 128).clamp(0, 255).to(torch.uint8)
+            weight_uint8 = q.to(torch_npu.hifloat8).view(torch.uint8)
 
             results.append((param_name, weight_uint8.to(output_device)))
             # Per-tensor scale: scalar fp32
