@@ -16,7 +16,7 @@
 
 Supports:
   - NVFP4 (W4A4/W4A16): via Triton-based blockwise fake quantization
-  - HiF8 (W8): per-element native weight-only quantization (NPU Dot encoding)
+  - HiF8 (W8): per-tensor scaled weight-only quantization (NPU Dot encoding)
 """
 
 from enum import Enum
@@ -392,10 +392,10 @@ class QATLinear(nn.Linear):
 
 
 # ============================================================================
-# HiF8 Per-Element Native Quantization
+# HiF8 Per-Tensor Quantization
 # ============================================================================
 # HiF8 is Huawei Ascend's native 8-bit float with tapered precision:
-# Dot field (2~4bit) determines Exponent/Mantissa allocation per element.
+# Dot field (2~4bit) determines Exponent/Mantissa allocation.
 # The NPU hardware handles Dot/Exponent/Mantissa encoding internally.
 #
 # QAT approach:
@@ -428,7 +428,7 @@ def hif8_native_fake_quant(tensor: torch.Tensor, scale: torch.Tensor) -> torch.T
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
-    """W8 HiF8 QAT: tensorwise scale → per-element native HiF8 roundtrip.
+    """W8 HiF8 QAT: tensorwise scale → per-tensor native HiF8 roundtrip.
 
     Forward:  scale = amax/49152,  quantize → dequantize
     Backward: reuse forward's scale, quantize gradient same way
