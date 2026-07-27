@@ -124,7 +124,7 @@ class QATQuantizer:
 
     Supports:
       - w4a16 / w4a4: NVFP4 quantization via compressed_tensors
-      - w8_hif8: HiF8 per-tensor weight-only quantization (no scales)
+      - w8_hif8: HiF8 per-element native + per-tensor scale (Delayed Scaling)
     """
 
     def __init__(
@@ -137,7 +137,7 @@ class QATQuantizer:
     ):
         self.mode = mode.lower()
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
-        self._is_hif8 = self.mode == "w8_hif8"  # W8 HiF8 weight-only per-tensor mode
+        self._is_hif8 = self.mode == "w8_hif8"  # W8 HiF8 weight-only, per-element native
         self.group_size = group_size
         self.ignore_patterns = ignore_patterns or ["lm_head", "embed_tokens", "re:.*mlp.gate$"]
         self.device = device or torch.device(get_device_name())
@@ -354,18 +354,17 @@ class QATQuantizer:
         layer_params: dict[str, torch.Tensor],
         output_device: torch.device,
     ) -> list[tuple[str, torch.Tensor]]:
-        """Quantize weights to HiF8 (per-tensor): bf16 → uint8 + fp32 scale.
+        """Quantize weights to HiF8: bf16 → uint8 + per-tensor fp32 scale.
 
-        Per-tensor shared exponent (one per weight tensor):
+        Per-tensor Delayed Scaling (document formula):
           amax = max(|weight|)
-          shared_exp = ceil(log2(amax / 15.0))
-          scale = 2^shared_exp
-          weight_q = clamp(round(weight / scale), -15, 15) → hifloat8 → uint8
+          scale = amax / F8max
+          weight_scaled = weight / scale
+          weight_uint8 = weight_scaled.to(hifloat8).view(uint8)
 
-        uint8 is just the byte container for hifloat8 values (IPC-compatible).
         Yields (name, weight_uint8) and (name + "_scale", scale_fp32).
         """
-        HIF8_15 = 15.0
+        HIF8_MAX = 49152.0  # HiF8 max: 2^15 × 1.5 (Dot=4, E=±15, M=1bit)
         layer_weights = {}
         layer_passthrough = {}
 
@@ -387,23 +386,16 @@ class QATQuantizer:
         for layer_name, (param_name, tensor) in layer_weights.items():
             weight = tensor.to(device=self.device, dtype=torch.float32)
 
-            # Per-tensor shared exponent
+            # Per-tensor Delayed Scaling: scale = amax / HIF8_MAX
             amax = weight.abs().max()
-            hif8_max_t = torch.tensor(HIF8_15, dtype=torch.float32, device=self.device)
-            safe_amax = amax if amax > 0 else torch.tensor(1e-38, device=self.device)
-            shared_exp = torch.clamp(
-                torch.ceil(torch.log2(safe_amax) - torch.log2(hif8_max_t)),
-                -127.0, 127.0
-            )
-            scale = torch.pow(2.0, shared_exp)  # scalar
+            safe_amax = amax if amax > 0 else torch.tensor(1e-12, device=self.device)
+            scale = safe_amax / HIF8_MAX
 
-            # Quantize: scale down → round → clamp → hifloat8 → uint8
-            q = torch.round(weight / scale)
-            q = torch.clamp(q, -HIF8_15, HIF8_15)
-            weight_uint8 = q.to(torch_npu.hifloat8).view(torch.uint8)
+            # Scale → native hifloat8 (NPU handles Dot encoding) → uint8
+            weight_scaled = weight / scale
+            weight_uint8 = weight_scaled.to(torch_npu.hifloat8).view(torch.uint8)
 
             results.append((param_name, weight_uint8.to(output_device)))
-            # Per-tensor scale: scalar fp32
             results.append((param_name + "_scale", scale.float().reshape(1).to(output_device)))
 
         for name, tensor in layer_passthrough.items():
