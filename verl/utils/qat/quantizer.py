@@ -124,7 +124,7 @@ class QATQuantizer:
 
     Supports:
       - w4a16 / w4a4: NVFP4 quantization via compressed_tensors
-      - w8_hif8: HiF8 per-element native + per-tensor scale (Delayed Scaling)
+      - w8_hif8: HiF8 per-element native + per-tensor scale (tensorwise)
     """
 
     def __init__(
@@ -356,7 +356,7 @@ class QATQuantizer:
     ) -> list[tuple[str, torch.Tensor]]:
         """Quantize weights to HiF8: bf16 → uint8 + per-tensor fp32 scale.
 
-        Per-tensor Delayed Scaling (document formula):
+        Per-tensor tensorwise (document formula):
           amax = max(|weight|)
           scale = amax / F8max
           weight_scaled = weight / scale
@@ -386,7 +386,7 @@ class QATQuantizer:
         for layer_name, (param_name, tensor) in layer_weights.items():
             weight = tensor.to(device=self.device, dtype=torch.float32)
 
-            # Per-tensor Delayed Scaling: scale = amax / HIF8_MAX
+            # Per-tensor tensorwise: scale = amax / HIF8_MAX
             amax = weight.abs().max()
             safe_amax = amax if amax > 0 else torch.tensor(1e-12, device=self.device)
             scale = safe_amax / HIF8_MAX
