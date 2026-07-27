@@ -399,23 +399,27 @@ class QATLinear(nn.Linear):
 # The NPU hardware handles Dot/Exponent/Mantissa encoding internally.
 #
 # QAT approach:
-#   Weight:    scaled per-element native — (w/scale).to(hifloat8).float()*scale
-#   Gradient:  scaled per-element native — same approach
+#   Weight:    tensorwise scaled — scale computed fresh each forward
+#   Gradient:  tensorwise scaled — same scale from forward reused
 #   Activation: not quantized (W8, weight-only QAT)
 #
-# Delayed Scaling: scale = amax / 49152, updated every 10 steps.
+# Tensorwise Scaling: scale = amax / 49152, computed online every forward.
 # ============================================================================
 
 
 # HiF8 max representable: 2^15 × 1.5 (Dot=4, E=±15, M=1bit)
 HIF8_MAX: float = 49152.0
-HIF8_SCALE_INTERVAL: int = 10  # Delayed Scaling update every N steps
+
+
+def _hif8_scale_from_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Tensorwise scale: scale = amax / HIF8_MAX (computed online each call)."""
+    amax = tensor.float().abs().max()
+    return (amax / HIF8_MAX).clamp(min=1e-12)
 
 
 def hif8_native_fake_quant(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Per-element HiF8 fake quant with per-tensor Delayed Scaling.
+    """Per-element HiF8 fake quant with per-tensor scale.
 
-    scale = amax / HIF8_MAX  (updated every N steps)
     tensor_scaled = tensor / scale       # fit into HiF8 range
     hif8 = tensor_scaled.to(hifloat8)    # NPU Dot/Exponent/Mantissa encoding
     dequant = hif8.float() * scale       # restore original range
@@ -424,14 +428,15 @@ def hif8_native_fake_quant(tensor: torch.Tensor, scale: torch.Tensor) -> torch.T
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
-    """W8 HiF8 QAT: per-tensor scale → per-element native HiF8 roundtrip.
+    """W8 HiF8 QAT: tensorwise scale → per-element native HiF8 roundtrip.
 
-    Forward:  weight/scale → .to(hifloat8) → ×scale  (scaled → encode → restore)
-    Backward: grad/scale   → .to(hifloat8) → ×scale  (same for gradients)
+    Forward:  scale = amax/49152,  quantize → dequantize
+    Backward: reuse forward's scale, quantize gradient same way
     """
 
     @staticmethod
-    def forward(ctx, tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        scale = _hif8_scale_from_tensor(tensor)
         ctx.save_for_backward(scale)
         return hif8_native_fake_quant(tensor, scale).to(tensor.dtype)
 
@@ -439,21 +444,19 @@ class HIF8FakeQuantFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
         (scale,) = ctx.saved_tensors
         grad_quant = hif8_native_fake_quant(grad_output, scale)
-        return grad_quant.to(grad_output.dtype), None
+        return grad_quant.to(grad_output.dtype),
 
 
 class HIF8QATLinear(nn.Linear):
-    """W8 HiF8 FakeQuantized Linear — weight-only + per-tensor Delayed Scaling.
+    """W8 HiF8 FakeQuantized Linear — weight-only + tensorwise scaling.
 
-    Each layer maintains a scale buffer, updated every HIF8_SCALE_INTERVAL steps:
-      amax = weight.abs().max()
-      scale = amax / HIF8_MAX    (simple div, not 2^ceil(log2(...)))
+    scale = weight.abs().max() / 49152  (computed fresh each forward)
 
     Forward:
-      weight_fq = (weight/scale).to(hifloat8).float() * scale  (scaled fake quant)
-      output = x @ weight_fq^T + bias                           (activation unchanged)
+      weight_fq = (weight/scale).to(hifloat8).float() * scale
+      output = x @ weight_fq^T + bias
 
-    FSDP-compatible (scale is a non-persistent buffer, not a Parameter).
+    FSDP-compatible (standard nn.Parameter, no extra state).
     """
 
     def __init__(
@@ -466,8 +469,6 @@ class HIF8QATLinear(nn.Linear):
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
         self.fake_quant_enabled: bool = True
-        self.register_buffer("_hif8_scale", torch.tensor(1.0, dtype=torch.float32))
-        self._hif8_step_counter: int = 0
 
     @classmethod
     def from_linear(cls, linear: nn.Linear) -> "HIF8QATLinear":
@@ -486,27 +487,16 @@ class HIF8QATLinear(nn.Linear):
                 new_linear.bias = nn.Parameter(linear.bias.clone())
         return new_linear
 
-    def _update_scale(self) -> None:
-        """Delayed Scaling: update scale every HIF8_SCALE_INTERVAL steps."""
-        self._hif8_step_counter += 1
-        if self._hif8_step_counter % HIF8_SCALE_INTERVAL != 0:
-            return
-        with torch.no_grad():
-            amax = self.weight.data.float().abs().max()
-            self._hif8_scale.data = (amax / HIF8_MAX).clamp(min=1e-12).to(self._hif8_scale.device)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.fake_quant_enabled:
             return F.linear(x, self.weight, self.bias)
 
-        self._update_scale()
-        weight_fq = HIF8FakeQuantFunction.apply(self.weight, self._hif8_scale)
+        weight_fq = HIF8FakeQuantFunction.apply(self.weight)
         return F.linear(x, weight_fq, self.bias)
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, "
-            f"scale={self._hif8_scale.item():.4e}, "
             f"fake_quant_enabled={self.fake_quant_enabled}"
         )
