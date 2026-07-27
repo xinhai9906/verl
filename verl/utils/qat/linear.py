@@ -407,43 +407,37 @@ class QATLinear(nn.Linear):
 # ============================================================================
 
 
-# HiF8 max representable: 2^15 × 1.5 (Dot=4, E=±15, M=1bit)
+# HiF8 max representable: 2^15 × 1.5 = 49152 (Dot=4b, E=4b range [-15,15], M=1b)
 HIF8_MAX: float = 49152.0
 
 
-def _hif8_scale_from_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Tensorwise scale: scale = amax / HIF8_MAX (computed online each call)."""
-    amax = tensor.float().abs().max()
-    return (amax / HIF8_MAX).clamp(min=1e-12)
+def hif8_native_fake_quant(tensor: torch.Tensor) -> torch.Tensor:
+    """Tensorwise HiF8 fake quant: scale = amax/49152, encode→decode roundtrip.
 
-
-def hif8_native_fake_quant(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Per-element HiF8 fake quant with per-tensor scale.
-
+    scale = amax / HIF8_MAX
     tensor_scaled = tensor / scale       # fit into HiF8 range
     hif8 = tensor_scaled.to(hifloat8)    # NPU Dot/Exponent/Mantissa encoding
     dequant = hif8.float() * scale       # restore original range
     """
-    return (tensor.float() / scale).to(torch_npu.hifloat8).float() * scale
+    amax = tensor.float().abs().max()
+    scale = (amax / HIF8_MAX).clamp(min=1e-12)
+    return ((tensor.float() / scale).to(torch_npu.hifloat8).float() * scale)
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
-    """W8 HiF8 QAT: tensorwise scale → per-tensor native HiF8 roundtrip.
+    """W8 HiF8 QAT: per-tensor scale → native HiF8 roundtrip.
 
-    Forward:  scale = amax/49152 (from weight), quantize → dequantize
-    Backward: scale = amax/49152 (from grad, independent), quantize same way
+    Forward:  scale = amax/49152 → encode → decode
+    Backward: scale = amax/49152 → encode → decode (independent)
     """
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
-        scale = _hif8_scale_from_tensor(tensor)
-        return hif8_native_fake_quant(tensor, scale).to(tensor.dtype)
+        return hif8_native_fake_quant(tensor).to(tensor.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
-        scale = _hif8_scale_from_tensor(grad_output)
-        grad_quant = hif8_native_fake_quant(grad_output, scale)
-        return grad_quant.to(grad_output.dtype),
+        return hif8_native_fake_quant(grad_output).to(grad_output.dtype),
 
 
 class HIF8QATLinear(nn.Linear):

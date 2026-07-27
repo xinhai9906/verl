@@ -364,7 +364,7 @@ class QATQuantizer:
 
         Yields (name, weight_uint8) and (name + "_scale", scale_fp32).
         """
-        HIF8_MAX = 49152.0  # HiF8 max: 2^15 × 1.5 (Dot=4, E=±15, M=1bit)
+        HIF8_MAX = 49152.0  # 2^15 × 1.5 (Dot=4b, E=4b range [-15,15], M=1b)
         layer_weights = {}
         layer_passthrough = {}
 
