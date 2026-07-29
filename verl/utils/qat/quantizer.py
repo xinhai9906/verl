@@ -160,7 +160,7 @@ def _encode_hif8(xq: torch.Tensor) -> torch.Tensor:
     m_bits = d4.int() * 1 + d3.int() * 2 + (d2 | d1 | d0).int() * 3
     mant = abs_x / torch.pow(2.0, e_raw.float()).clamp(min=1e-30)
     M = torch.round((mant - 1.0) * torch.pow(2.0, m_bits.float()))
-    M = M.clamp(0, (1 << m_bits.clamp(0, 8)) - 1).int()
+    M = M.clamp(0, torch.pow(2.0, m_bits.float()).int() - 1).int()
 
     # Pack: S(7) | Dot | E_field | M(0)
     out = (S.int() << 7)
