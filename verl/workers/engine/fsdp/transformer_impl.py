@@ -879,7 +879,8 @@ class FSDPEngine(BaseEngine):
                 for name, param in params.items()
             )
 
-        if self._qat_enabled:
+        if self._qat_enabled and self._qat_config.mode != "w8_hif8":
+            # NVFP4 QAT: quantize weights before IPC
             from verl.utils.qat.quantizer import QATQuantizer
             from verl.utils.torch_dtypes import PrecisionType
 
