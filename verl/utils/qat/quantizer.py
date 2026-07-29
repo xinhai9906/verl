@@ -118,65 +118,8 @@ def fuse_global_scales(
     return fused_scales
 
 
-def _encode_hif8(xq: torch.Tensor) -> torch.Tensor:
-    """Encode software-quantized HiF8 values into true HiF8 uint8 bit format.
-
-    Exponent is sign-magnitude: E_field = [Es(1b)][Emag(Db)].
-    Dot bands and bit layout:
-      Dot=4: S(7) | 11(6,5) | Es,Emag2..0(4..1) | M(0)     E=1sign+3mag
-      Dot=3: S(7) | 10(6,5) | Es,Emag1..0(4..2) | M(1,0)   E=1sign+2mag
-      Dot=2: S(7) | 01(6,5) | Es,Emag0(4,3) | M(2,1,0)     E=1sign+1mag
-      Dot=1: S(7) | 001(6,5,4) | Es(3) | M(2,1,0)           E=1sign+0mag
-      Dot=0: S(7) | 0001(6,5,4,3) | M(2,1,0)                E=0
-    """
-    xf = xq.float()
-    S = (xf < 0)
-    abs_x = xf.abs()
-    eps = abs_x.amax().clamp(min=1e-30) * 1e-12
-    e_raw = torch.floor(torch.log2(abs_x + eps)).int()
-    abse = e_raw.abs().int()
-    Es = (e_raw < 0).int()  # exponent sign: 0=pos, 1=neg
-
-    # Dot bands
-    d4 = abse >= 8
-    d3 = (abse >= 4) & (~d4)
-    d2 = (abse >= 2) & (~d4) & (~d3)
-    d1 = (abse == 1)
-    d0 = (~d4) & (~d3) & (~d2) & (~d1)
-
-    dot_enc = (d4.int() * 0b11 + d3.int() * 0b10 + d2.int() * 0b01
-               + d1.int() * 0b001 + d0.int() * 0b0001)
-    dot_len = (d4 | d3 | d2).int() * 2 + d1.int() * 3 + d0.int() * 4
-
-    # Exponent magnitude bits (stored, without implicit MSB=1)
-    e_mag_bits = d4.int() * 3 + d3.int() * 2 + d2.int() * 1
-    e_implicit = d4.int() * 8 + d3.int() * 4 + d2.int() * 2 + d1.int() * 1
-    e_mag = (abse - e_implicit).clamp(0, 15).int()
-
-    # E field = [Es @ high bit][Emag @ low bits]
-    e_field = (Es << e_mag_bits) | e_mag
-
-    # Mantissa
-    m_bits = d4.int() * 1 + d3.int() * 2 + (d2 | d1 | d0).int() * 3
-    mant = abs_x / torch.pow(2.0, e_raw.float()).clamp(min=1e-30)
-    M = torch.round((mant - 1.0) * torch.pow(2.0, m_bits.float()))
-    M = M.clamp(0, torch.pow(2.0, m_bits.float()).int() - 1).int()
-
-    # Pack: S(7) | Dot | E_field | M(0)
-    out = (S.int() << 7)
-    out |= dot_enc << (7 - dot_len)
-    out |= e_field << m_bits
-    out |= M
-    return out.to(torch.uint8)
-
-
 class QATQuantizer:
-    """Quantizer for QAT-trained weights using compressed_tensors APIs.
-
-    Supports:
-      - w4a16 / w4a4: NVFP4 quantization via compressed_tensors
-      - w8_hif8: HiF8 per-tensor native + per-tensor scale (tensorwise)
-    """
+    """Quantizer for NVFP4 (W4A4/W4A16) QAT-trained weights."""
 
     def __init__(
         self,
@@ -188,23 +131,20 @@ class QATQuantizer:
     ):
         self.mode = mode.lower()
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
-        self._is_hif8 = self.mode == "w8_hif8"  # W8 HiF8 weight-only, per-tensor native
         self.group_size = group_size
         self.ignore_patterns = ignore_patterns or ["lm_head", "embed_tokens", "re:.*mlp.gate$"]
         self.device = device or torch.device(get_device_name())
         self.param_dtype = param_dtype
 
-        # HiF8 mode doesn't use compressed_tensors
-        if not self._is_hif8:
-            self._compressor = NVFP4PackedCompressor()
-            self._quant_args = QuantizationArgs(
-                num_bits=4,
-                type=QuantizationType.FLOAT,
-                symmetric=True,
-                strategy=QuantizationStrategy.TENSOR_GROUP,
-                group_size=group_size,
-                scale_dtype=FP8_E4M3_DATA.dtype,
-            )
+        self._compressor = NVFP4PackedCompressor()
+        self._quant_args = QuantizationArgs(
+            num_bits=4,
+            type=QuantizationType.FLOAT,
+            symmetric=True,
+            strategy=QuantizationStrategy.TENSOR_GROUP,
+            group_size=group_size,
+            scale_dtype=FP8_E4M3_DATA.dtype,
+        )
 
     def _should_quantize(self, name: str, tensor: torch.Tensor) -> bool:
         """Check if parameter should be quantized."""
@@ -213,8 +153,7 @@ class QATQuantizer:
         if tensor.dim() != 2:
             return False
 
-        # HiF8 per-tensor: no block/group dimension constraint
-        if not self._is_hif8 and tensor.shape[1] % self.group_size != 0:
+        if tensor.shape[1] % self.group_size != 0:
             return False
 
         module_name = name.rsplit(".weight", 1)[0]
@@ -332,11 +271,6 @@ class QATQuantizer:
 
         output_device = target_device or torch.device("cpu")
 
-        # Dispatch to HiF8 path for w8_hif8 mode
-        if self._is_hif8:
-            yield from self._quantize_with_fusion_hif8(params, output_device)
-            return
-
         _sentinel = object()
         current_layer_idx = _sentinel
         layer_buffer: dict[str, torch.Tensor] = {}
@@ -368,92 +302,6 @@ class QATQuantizer:
             yield from self._process_layer_group(current_layer_idx, layer_buffer, input_global_scales, output_device)
 
         get_torch_device().empty_cache()
-
-    def _quantize_with_fusion_hif8(
-        self,
-        params: Iterable[tuple[str, torch.Tensor]],
-        output_device: torch.device,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """HiF8 per-tensor quantization: bf16 → uint8 + per-tensor scale."""
-        _sentinel = object()
-        current_layer_idx = _sentinel
-        layer_buffer: dict[str, torch.Tensor] = {}
-
-        for name, tensor in params:
-            tensor_cpu = tensor.to("cpu") if tensor.is_cuda else tensor
-            layer_idx = self._extract_layer_idx(name)
-
-            if layer_idx != current_layer_idx and current_layer_idx is not _sentinel and layer_buffer:
-                yield from self._process_layer_hif8(
-                    current_layer_idx, layer_buffer, output_device
-                )
-                layer_buffer = {}
-
-            current_layer_idx = layer_idx
-            layer_buffer[name] = tensor_cpu
-
-        if layer_buffer:
-            yield from self._process_layer_hif8(
-                current_layer_idx, layer_buffer, output_device
-            )
-
-        get_torch_device().empty_cache()
-
-    def _process_layer_hif8(
-        self,
-        layer_idx: Optional[int],
-        layer_params: dict[str, torch.Tensor],
-        output_device: torch.device,
-    ) -> list[tuple[str, torch.Tensor]]:
-        """Quantize weights to HiF8: bf16 → uint8 + per-tensor fp32 scale.
-
-        Per-tensor tensorwise (document formula):
-          amax = max(|weight|)
-          scale = amax / F8max
-          weight_scaled = weight / scale
-          weight_uint8 = weight_scaled.to(hifloat8).view(uint8)
-
-        Yields (name, weight_uint8) and (name + "_scale", scale_fp32).
-        """
-        HIF8_MAX = 49152.0  # 2^15 × 1.5 (Dot=4b, E=4b range [-15,15], M=1b)
-        layer_weights = {}
-        layer_passthrough = {}
-
-        for name, tensor in layer_params.items():
-            if "input_global_scale" in name or "input_amax" in name:
-                continue
-
-            if self._should_quantize(name, tensor):
-                layer_name = name.rsplit(".weight", 1)[0]
-                layer_weights[layer_name] = (name, tensor)
-            else:
-                layer_passthrough[name] = tensor
-
-        if not layer_weights:
-            return [(name, tensor.to(output_device)) for name, tensor in layer_passthrough.items()]
-
-        results = []
-
-        for layer_name, (param_name, tensor) in layer_weights.items():
-            weight = tensor.to(device=self.device, dtype=torch.float32)
-
-            # Per-tensor tensorwise: scale = amax / HIF8_MAX
-            amax = weight.abs().max()
-            safe_amax = amax if amax > 0 else torch.tensor(1e-12, device=self.device)
-            scale = safe_amax / HIF8_MAX
-
-            # Scale → _quant_hif8 → encode to true HiF8 bytes → uint8
-            from verl.utils.qat.linear import _quant_hif8
-            weight_scaled = _quant_hif8(weight / scale)
-            weight_uint8 = _encode_hif8(weight_scaled)
-
-            results.append((param_name, weight_uint8.to(output_device)))
-            results.append((param_name + "_scale", scale.float().reshape(1).to(output_device)))
-
-        for name, tensor in layer_passthrough.items():
-            results.append((name, tensor.to(output_device)))
-
-        return results
 
 
 __all__ = [
