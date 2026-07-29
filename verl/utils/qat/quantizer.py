@@ -119,7 +119,7 @@ def fuse_global_scales(
 
 
 class QATQuantizer:
-    """Quantizer for NVFP4 (W4A4/W4A16) QAT-trained weights."""
+    """Quantizer for QAT-trained weights using compressed_tensors APIs."""
 
     def __init__(
         self,
@@ -152,7 +152,6 @@ class QATQuantizer:
             return False
         if tensor.dim() != 2:
             return False
-
         if tensor.shape[1] % self.group_size != 0:
             return False
 
