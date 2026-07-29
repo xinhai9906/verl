@@ -16,14 +16,13 @@
 
 Supports:
   - NVFP4 (W4A4/W4A16): via Triton-based blockwise fake quantization
-  - HiF8 (W8): per-tensor scaled weight-only quantization (NPU Dot encoding)
+  - HiF8 (W8): per-tensor scaled, tapered-precision software fake quant
 """
 
 from enum import Enum
 from typing import Optional
 
 import torch
-import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -394,50 +393,70 @@ class QATLinear(nn.Linear):
 # ============================================================================
 # HiF8 Per-Tensor Quantization
 # ============================================================================
-# HiF8 is Huawei Ascend's native 8-bit float with tapered precision:
-# Dot field (2~4bit) determines Exponent/Mantissa allocation.
-# The NPU hardware handles Dot/Exponent/Mantissa encoding internally.
+# HiF8 is Huawei Ascend's native 8-bit float with tapered precision.
+# Fake quant uses pure-software _quant_hif8 that models the Dot-band encoding:
+#   |e|<=3→3b, |e|<=7→2b, |e|<=15→1b mantissa.
 #
 # QAT approach:
-#   Weight:    tensorwise scaled — scale computed fresh each forward
+#   Weight:    tensorwise scaled — scale = amax/49152, computed fresh each forward
 #   Gradient:  tensorwise scaled — own scale computed from grad
 #   Activation: not quantized (W8, weight-only QAT)
-#
-# Tensorwise Scaling: scale = amax / 49152, computed online every forward.
 # ============================================================================
 
 
-# HiF8 max representable: 2^15 × 1.5 = 49152 (Dot=4b, E=4b range [-15,15], M=1b)
+# HiF8 max: 2^15 × 1.5 = 49152 (Dot=4b, E=4b range [-15,15], M=1b)
 HIF8_MAX: float = 49152.0
 
 
-def hif8_native_fake_quant(tensor: torch.Tensor) -> torch.Tensor:
-    """Tensorwise HiF8 fake quant: scale = amax/49152, encode→decode roundtrip.
+def _quant_hif8(x: torch.Tensor) -> torch.Tensor:
+    """Raw HiFloat8 quantization with tapered precision (per element).
 
-    scale = amax / HIF8_MAX
-    tensor_scaled = tensor / scale       # fit into HiF8 range
-    hif8 = tensor_scaled.to(hifloat8)    # NPU Dot/Exponent/Mantissa encoding
-    dequant = hif8.float() * scale       # restore original range
+    Models the HiF8 Dot-band encoding in pure software:
+      |e| <= 3  → 3-bit mantissa (Dot=2)
+      |e| <= 7  → 2-bit mantissa (Dot=3)
+      |e| <= 15 → 1-bit mantissa (Dot=4)
+
+    No Python branches — safe for torch.compile / graph capture.
+    """
+    x_unsigned = x.abs()
+    sign = x.sign()
+    eps = x_unsigned.amax().clamp(min=1e-30) * 1e-8
+    e = torch.floor(torch.log2(x_unsigned + eps))
+    abse = e.abs()
+    mant_bits = torch.where(abse <= 3, 3.0,
+                   torch.where(abse <= 7, 2.0,
+                   torch.where(abse <= 15, 1.0, 0.0)))
+    q = torch.floor(x_unsigned * 2.0 ** (-e + mant_bits) + 0.5)
+    return q * 2.0 ** (e - mant_bits) * sign
+
+
+def hif8_fake_quant(tensor: torch.Tensor) -> torch.Tensor:
+    """Per-tensor HiF8 fake quant: scale → encode → decode roundtrip.
+
+    scale = amax / 49152
+    scaled = tensor / scale              # bring into HiF8 range
+    hif8 = _quant_hif8(scaled.float())   # tapered precision rounding
+    dequant = hif8 * scale               # restore original range
     """
     amax = tensor.float().abs().max()
     scale = (amax / HIF8_MAX).clamp(min=1e-12)
-    return ((tensor.float() / scale).to(torch_npu.hifloat8).float() * scale)
+    return _quant_hif8(tensor.float() / scale) * scale
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
-    """W8 HiF8 QAT: per-tensor scale → native HiF8 roundtrip.
+    """W8 HiF8 QAT: per-tensor scale → tapered precision roundtrip.
 
-    Forward:  scale = amax/49152 → encode → decode
-    Backward: scale = amax/49152 → encode → decode (independent)
+    Forward:  scale = amax/49152 → _quant_hif8 → ×scale
+    Backward: scale = amax/49152 → _quant_hif8 → ×scale (independent)
     """
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
-        return hif8_native_fake_quant(tensor).to(tensor.dtype)
+        return hif8_fake_quant(tensor).to(tensor.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
-        return hif8_native_fake_quant(grad_output).to(grad_output.dtype),
+        return hif8_fake_quant(grad_output).to(grad_output.dtype),
 
 
 class HIF8QATLinear(nn.Linear):
@@ -446,8 +465,9 @@ class HIF8QATLinear(nn.Linear):
     scale = weight.abs().max() / 49152  (computed fresh each forward)
 
     Forward:
-      weight_fq = (weight/scale).to(hifloat8).float() * scale
-      output = x @ weight_fq^T + bias
+      weight_scaled = weight / scale
+      weight_fq = _quant_hif8(weight_scaled) * scale  (tapered precision roundtrip)
+      output = x @ weight_fq^T + bias                  (activation bf16)
 
     FSDP-compatible (standard nn.Parameter, no extra state).
     """

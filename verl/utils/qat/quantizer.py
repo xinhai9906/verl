@@ -25,7 +25,6 @@ import re
 from typing import Generator, Iterable, Optional
 
 import torch
-import torch_npu
 from compressed_tensors.compressors.quantized_compressors.fp4_quantized import NVFP4PackedCompressor
 from compressed_tensors.quantization.quant_args import (
     FP4_E2M1_DATA,
@@ -117,6 +116,58 @@ def fuse_global_scales(
             fused_scales[name] = scale
 
     return fused_scales
+
+
+def _encode_hif8(xq: torch.Tensor) -> torch.Tensor:
+    """Encode software-quantized HiF8 values into true HiF8 uint8 bit format.
+
+    Exponent is sign-magnitude: E_field = [Es(1b)][Emag(Db)].
+    Dot bands and bit layout:
+      Dot=4: S(7) | 11(6,5) | Es,Emag2..0(4..1) | M(0)     E=1sign+3mag
+      Dot=3: S(7) | 10(6,5) | Es,Emag1..0(4..2) | M(1,0)   E=1sign+2mag
+      Dot=2: S(7) | 01(6,5) | Es,Emag0(4,3) | M(2,1,0)     E=1sign+1mag
+      Dot=1: S(7) | 001(6,5,4) | Es(3) | M(2,1,0)           E=1sign+0mag
+      Dot=0: S(7) | 0001(6,5,4,3) | M(2,1,0)                E=0
+    """
+    xf = xq.float()
+    S = (xf < 0)
+    abs_x = xf.abs()
+    eps = abs_x.amax().clamp(min=1e-30) * 1e-12
+    e_raw = torch.floor(torch.log2(abs_x + eps)).int()
+    abse = e_raw.abs().int()
+    Es = (e_raw < 0).int()  # exponent sign: 0=pos, 1=neg
+
+    # Dot bands
+    d4 = abse >= 8
+    d3 = (abse >= 4) & (~d4)
+    d2 = (abse >= 2) & (~d4) & (~d3)
+    d1 = (abse == 1)
+    d0 = (~d4) & (~d3) & (~d2) & (~d1)
+
+    dot_enc = (d4.int() * 0b11 + d3.int() * 0b10 + d2.int() * 0b01
+               + d1.int() * 0b001 + d0.int() * 0b0001)
+    dot_len = (d4 | d3 | d2).int() * 2 + d1.int() * 3 + d0.int() * 4
+
+    # Exponent magnitude bits (stored, without implicit MSB=1)
+    e_mag_bits = d4.int() * 3 + d3.int() * 2 + d2.int() * 1
+    e_implicit = d4.int() * 8 + d3.int() * 4 + d2.int() * 2 + d1.int() * 1
+    e_mag = (abse - e_implicit).clamp(0, 15).int()
+
+    # E field = [Es @ high bit][Emag @ low bits]
+    e_field = (Es << e_mag_bits) | e_mag
+
+    # Mantissa
+    m_bits = d4.int() * 1 + d3.int() * 2 + (d2 | d1 | d0).int() * 3
+    mant = abs_x / torch.pow(2.0, e_raw.float()).clamp(min=1e-30)
+    M = torch.round((mant - 1.0) * torch.pow(2.0, m_bits.float()))
+    M = M.clamp(0, (1 << m_bits.clamp(0, 8)) - 1).int()
+
+    # Pack: S(7) | Dot | E_field | M(0)
+    out = (S.int() << 7)
+    out |= dot_enc << (7 - dot_len)
+    out |= e_field << m_bits
+    out |= M
+    return out.to(torch.uint8)
 
 
 class QATQuantizer:
@@ -391,9 +442,10 @@ class QATQuantizer:
             safe_amax = amax if amax > 0 else torch.tensor(1e-12, device=self.device)
             scale = safe_amax / HIF8_MAX
 
-            # Scale → native hifloat8 (NPU handles Dot encoding) → uint8
-            weight_scaled = weight / scale
-            weight_uint8 = weight_scaled.to(torch_npu.hifloat8).view(torch.uint8)
+            # Scale → _quant_hif8 → encode to true HiF8 bytes → uint8
+            from verl.utils.qat.linear import _quant_hif8
+            weight_scaled = _quant_hif8(weight / scale)
+            weight_uint8 = _encode_hif8(weight_scaled)
 
             results.append((param_name, weight_uint8.to(output_device)))
             results.append((param_name + "_scale", scale.float().reshape(1).to(output_device)))
