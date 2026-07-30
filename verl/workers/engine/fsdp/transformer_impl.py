@@ -523,7 +523,7 @@ class FSDPEngine(BaseEngine):
                 "activation_observer": self._qat_config.activation_observer,
             },
         )
-        if self._qat_config.mode != "w8_hif8":
+        if self._qat_config.mode not in ("w8_hif8", "w8a8_hif8"):
             enable_qat_fuse(module)
 
         if self._qat_config.mode == "w4a4":
@@ -879,7 +879,7 @@ class FSDPEngine(BaseEngine):
                 for name, param in params.items()
             )
 
-        if self._qat_enabled and self._qat_config.mode != "w8_hif8":
+        if self._qat_enabled and self._qat_config.mode not in ("w8_hif8", "w8a8_hif8"):
             # NVFP4 QAT: quantize weights before IPC
             from verl.utils.qat.quantizer import QATQuantizer
             from verl.utils.torch_dtypes import PrecisionType

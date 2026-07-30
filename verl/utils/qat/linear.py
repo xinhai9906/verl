@@ -16,7 +16,7 @@
 
 Supports:
   - NVFP4 (W4A4/W4A16): via Triton-based blockwise fake quantization
-  - HiF8 (W8): per-tensor scaled, tapered-precision software fake quant
+  - HiF8 (W8 / W8A8): per-tensor scaled, tapered-precision software fake quant
 """
 
 from enum import Enum
@@ -400,7 +400,7 @@ class QATLinear(nn.Linear):
 # QAT approach:
 #   Weight:    tensorwise scaled — scale = amax/49152, computed fresh each forward
 #   Gradient:  tensorwise scaled — own scale computed from grad
-#   Activation: not quantized (W8, weight-only QAT)
+#   Activation: optional (W8 weight-only or W8A8 full)
 # ============================================================================
 
 
@@ -444,7 +444,7 @@ def hif8_fake_quant(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
-    """W8 HiF8 QAT: per-tensor scale → tapered precision roundtrip.
+    """HiF8 QAT: per-tensor scale → tapered precision roundtrip.
 
     Forward:  scale = amax/49152 → _quant_hif8 → ×scale
     Backward: scale = amax/49152 → _quant_hif8 → ×scale (independent)
@@ -460,15 +460,12 @@ class HIF8FakeQuantFunction(torch.autograd.Function):
 
 
 class HIF8QATLinear(nn.Linear):
-    """W8 HiF8 FakeQuantized Linear — weight-only + tensorwise scaling.
+    """HiF8 FakeQuantized Linear — per-tensor tensorwise scaling.
 
-    scale = weight.abs().max() / 49152  (computed fresh each forward)
+    mode='w8':       weight-only fake quant
+    mode='w8a8':     weight + activation fake quant
 
-    Forward:
-      weight_scaled = weight / scale
-      weight_fq = _quant_hif8(weight_scaled) * scale  (tapered precision roundtrip)
-      output = x @ weight_fq^T + bias                  (activation bf16)
-
+    scale = amax / 49152  (computed fresh each forward)
     FSDP-compatible (standard nn.Parameter, no extra state).
     """
 
@@ -477,19 +474,22 @@ class HIF8QATLinear(nn.Linear):
         in_features: int,
         out_features: int,
         bias: bool = True,
+        quantize_activation: bool = False,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
+        self.quantize_activation = quantize_activation
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "HIF8QATLinear":
+    def from_linear(cls, linear: nn.Linear, quantize_activation: bool = False) -> "HIF8QATLinear":
         """Create HIF8QATLinear from an existing nn.Linear, copying weights."""
         has_bias = linear.bias is not None
         new_linear = cls(
             in_features=linear.in_features,
             out_features=linear.out_features,
             bias=has_bias,
+            quantize_activation=quantize_activation,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
         )
@@ -501,4 +501,6 @@ class HIF8QATLinear(nn.Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight_fq = HIF8FakeQuantFunction.apply(self.weight)
+        if self.quantize_activation:
+            x = HIF8FakeQuantFunction.apply(x)
         return F.linear(x, weight_fq, self.bias)

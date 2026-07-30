@@ -32,7 +32,7 @@ class QATConfig(BaseConfig):
     """Unified configuration for QAT (Quantization-Aware Training)."""
 
     enable: bool = False
-    mode: str = "w4a16"  # "w4a16", "w4a4", or "w8_hif8"
+    mode: str = "w4a16"  # "w4a16", "w4a4", "w8_hif8", or "w8a8_hif8"
     group_size: int = 16  # block size for NVFP4 (not used by HiF8)
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
@@ -76,7 +76,7 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
                 return False
 
     # HiF8 per-tensor: no dimension constraint
-    if config.mode == "w8_hif8":
+    if config.mode in ("w8_hif8", "w8a8_hif8"):
         return True
 
     if module.in_features % config.group_size != 0:
@@ -126,15 +126,22 @@ def apply_qat(
         logger.info("QAT is disabled, returning original model")
         return model
 
-    if config.mode == "w8_hif8":
+    if config.mode in ("w8_hif8", "w8a8_hif8"):
         from verl.utils.qat.linear import HIF8QATLinear
 
-        logger.info("Applying QAT with mode=w8_hif8 (weight-only, per-tensor scaled native HiF8)")
+        quantize_act = (config.mode == "w8a8_hif8")
+        logger.info(f"Applying QAT with mode={config.mode} "
+                     f"({'W8A8' if quantize_act else 'W8 weight-only'}, "
+                     f"per-tensor scaled HiF8)")
+
+        def _hif8_factory(linear: nn.Linear) -> HIF8QATLinear:
+            return HIF8QATLinear.from_linear(linear, quantize_activation=quantize_act)
+
         _replace_modules(
             model, config,
-            factory=HIF8QATLinear.from_linear,
+            factory=_hif8_factory,
             target_cls=HIF8QATLinear,
-            mode_label="HiF8 QAT",
+            mode_label=f"HiF8 QAT ({config.mode})",
         )
         return model
 
