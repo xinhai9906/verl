@@ -33,7 +33,8 @@ class QATConfig(BaseConfig):
 
     enable: bool = False
     mode: str = "w4a16"  # "w4a16", "w4a4", "w8_hif8", or "w8a8_hif8"
-    group_size: int = 16  # block size for NVFP4 (not used by HiF8)
+    granularity: str = "per_tensor"  # HiF8 granularity: "per_tensor", "per_channel", or "per_group"
+    group_size: int = 16  # block size for NVFP4; also used by HiF8 per_group mode
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
@@ -75,7 +76,7 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
                 logger.debug(f"Ignoring {name} due to pattern: {pattern}")
                 return False
 
-    # HiF8 per-tensor: no dimension constraint
+    # HiF8: no dimension constraint (padding handled internally for per_group)
     if config.mode in ("w8_hif8", "w8a8_hif8"):
         return True
 
@@ -130,18 +131,22 @@ def apply_qat(
         from verl.utils.qat.linear import HIF8QATLinear
 
         quantize_act = (config.mode == "w8a8_hif8")
+        granularity = getattr(config, "granularity", "per_tensor")
+        group_size = getattr(config, "group_size", 32)
         logger.info(f"Applying QAT with mode={config.mode} "
                      f"({'W8A8' if quantize_act else 'W8 weight-only'}, "
-                     f"per-tensor scaled HiF8)")
+                     f"granularity={granularity}, group_size={group_size})")
 
         def _hif8_factory(linear: nn.Linear) -> HIF8QATLinear:
-            return HIF8QATLinear.from_linear(linear, quantize_activation=quantize_act)
+            return HIF8QATLinear.from_linear(
+                linear, quantize_activation=quantize_act,
+                granularity=granularity, group_size=group_size)
 
         _replace_modules(
             model, config,
             factory=_hif8_factory,
             target_cls=HIF8QATLinear,
-            mode_label=f"HiF8 QAT ({config.mode})",
+            mode_label=f"HiF8 QAT ({config.mode}, {granularity})",
         )
         return model
 
