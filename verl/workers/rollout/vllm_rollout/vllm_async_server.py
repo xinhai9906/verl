@@ -877,6 +877,9 @@ class vLLMHttpServer:
 
                 apply_qat_patches()
                 quantization = "compressed-tensors"
+            elif quant_method == "ascend-hif8":
+                quantization = "ascend-hif8"
+                logger.info("QAT HiF8 quantization configured for vLLM Ascend")
             else:
                 raise ValueError(f"Unsupported quant_method: {quant_method}")
 

@@ -1,0 +1,6 @@
+{
+  "quant_method": "ascend-hif8",
+  "granularity": "per_tensor",
+  "group_size": 32,
+  "ignore": ["lm_head", "embed_tokens"]
+}

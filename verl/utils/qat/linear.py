@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["QATLinear", "QATMode"]
+__all__ = ["QATLinear", "QATMode", "HIF8QATLinear", "HIF8FakeQuantFunction"]
 
 
 import triton
@@ -383,3 +383,152 @@ class QATLinear(nn.Linear):
             f"bias={self.bias is not None}, mode={self.mode.value}, "
             f"group_size={self.group_size}, fake_quant_enabled={self.fake_quant_enabled}"
         )
+
+
+# ============================================================================
+# HiF8 Quantization
+# ============================================================================
+# HiF8 is Huawei Ascend's native 8-bit float with tapered precision.
+# Fake quant uses pure-software _quant_hif8 that models the Dot-band encoding:
+#   |e|<=3→3b, |e|<=7→2b, |e|<=15→1b mantissa.
+#
+# Granularity modes:
+#   per_tensor:  one scale per tensor (weight: scalar, activation: scalar)
+#   per_channel: one scale per output channel (weight: (out,1), activation: per-token)
+#   per_group:   one scale per group of 32 elements along last dim
+# ============================================================================
+
+
+# HiF8 max: 2^15 × 1.5 = 49152 (Dot=4b, E=4b range [-15,15], M=1b)
+HIF8_MAX: float = 49152.0
+
+
+def _quant_hif8(x: torch.Tensor) -> torch.Tensor:
+    """Raw HiFloat8 quantization with tapered precision (per element).
+    Models the HiF8 Dot-band encoding in pure software:
+      |e| <= 3  → 3-bit mantissa (Dot=2)
+      |e| <= 7  → 2-bit mantissa (Dot=3)
+      |e| <= 15 → 1-bit mantissa (Dot=4)
+    No Python branches — safe for torch.compile / graph capture.
+    """
+    x_unsigned = x.abs()
+    sign = x.sign()
+    eps = x_unsigned.amax().clamp(min=1e-30) * 1e-8
+    e = torch.floor(torch.log2(x_unsigned + eps))
+    abse = e.abs()
+    mant_bits = torch.where(abse <= 3, 3.0,
+                   torch.where(abse <= 7, 2.0,
+                   torch.where(abse <= 15, 1.0, 0.0)))
+    q = torch.floor(x_unsigned * 2.0 ** (-e + mant_bits) + 0.5)
+    return q * 2.0 ** (e - mant_bits) * sign
+
+
+def hif8_fake_quant(
+    tensor: torch.Tensor, granularity: str = "per_tensor", group_size: int = 32
+) -> torch.Tensor:
+    """HiF8 fake quant: scale → encode → decode roundtrip.
+    granularity='per_tensor':  one scale per tensor  (amax over all elements)
+    granularity='per_channel': one scale per row      (amax along last dim)
+    granularity='per_group':   one scale per group    (amax per group_size along last dim)
+    """
+    if granularity == "per_group":
+        t = tensor.float()
+        dim_size = t.shape[-1]
+        pad = (group_size - dim_size % group_size) % group_size
+        if pad:
+            t = F.pad(t, (0, pad))
+        t_blocks = t.unflatten(-1, (-1, group_size))
+        amax = t_blocks.abs().amax(dim=-1, keepdim=True)
+        scale = (amax / HIF8_MAX).clamp(min=1e-12)
+        q_blocks = _quant_hif8(t_blocks / scale) * scale
+        result = q_blocks.flatten(-2, -1)
+        if pad:
+            result = result[..., :dim_size]
+        return result.to(tensor.dtype)
+    elif granularity == "per_channel":
+        amax = tensor.float().abs().amax(dim=-1, keepdim=True)
+    else:
+        amax = tensor.float().abs().max()
+    scale = (amax / HIF8_MAX).clamp(min=1e-12)
+    return (_quant_hif8(tensor.float() / scale) * scale).to(tensor.dtype)
+
+
+class HIF8FakeQuantFunction(torch.autograd.Function):
+    """HiF8 QAT: configurable granularity → tapered precision roundtrip.
+    Forward:  scale = amax/49152 → _quant_hif8 → ×scale
+    Backward: same granularity → scale = amax/49152 → _quant_hif8 → ×scale
+    """
+
+    @staticmethod
+    def forward(
+        ctx, tensor: torch.Tensor,
+        granularity: str = "per_tensor", group_size: int = 32
+    ) -> torch.Tensor:
+        ctx.granularity = granularity
+        ctx.group_size = group_size
+        return hif8_fake_quant(tensor, granularity, group_size).to(tensor.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        return (hif8_fake_quant(grad_output, ctx.granularity, ctx.group_size)
+                .to(grad_output.dtype), None, None)
+
+
+class HIF8QATLinear(nn.Linear):
+    """HiF8 FakeQuantized Linear — configurable granularity + activation.
+    granularity='per_tensor':  one scale per tensor
+    granularity='per_channel': one scale per output channel (weight) / token (act)
+    granularity='per_group':   one scale per group of group_size elements
+    quantize_activation=False: W8 (weight-only)
+    quantize_activation=True:  W8A8 (full)
+    FSDP-compatible (standard nn.Parameter, no extra state).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        quantize_activation: bool = False,
+        granularity: str = "per_tensor",
+        group_size: int = 32,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
+        self.quantize_activation = quantize_activation
+        self.granularity = granularity
+        self.group_size = group_size
+
+    @classmethod
+    def from_linear(
+        cls, linear: nn.Linear,
+        quantize_activation: bool = False,
+        granularity: str = "per_tensor",
+        group_size: int = 32,
+    ) -> "HIF8QATLinear":
+        """Create HIF8QATLinear from an existing nn.Linear, copying weights."""
+        has_bias = linear.bias is not None
+        new_linear = cls(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            bias=has_bias,
+            quantize_activation=quantize_activation,
+            granularity=granularity,
+            group_size=group_size,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+        if linear.weight.device != torch.device("meta"):
+            new_linear.weight = nn.Parameter(linear.weight.clone())
+            if has_bias:
+                new_linear.bias = nn.Parameter(linear.bias.clone())
+        return new_linear
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight_fq = HIF8FakeQuantFunction.apply(
+            self.weight, self.granularity, self.group_size)
+        if self.quantize_activation:
+            x = HIF8FakeQuantFunction.apply(
+                x, self.granularity, self.group_size)
+        return F.linear(x, weight_fq, self.bias)

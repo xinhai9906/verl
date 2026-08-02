@@ -18,7 +18,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch.nn as nn
 
@@ -32,8 +32,9 @@ class QATConfig(BaseConfig):
     """Unified configuration for QAT (Quantization-Aware Training)."""
 
     enable: bool = False
-    mode: str = "w4a16"
-    group_size: int = 16
+    mode: str = "w4a16"  # "w4a16", "w4a4", "w8_hif8", or "w8a8_hif8"
+    granularity: str = "per_tensor"  # HiF8 granularity: "per_tensor", "per_channel", or "per_group"
+    group_size: int = 16  # block size for NVFP4; also used by HiF8 per_group mode
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
@@ -75,6 +76,9 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
                 logger.debug(f"Ignoring {name} due to pattern: {pattern}")
                 return False
 
+    if config.mode in ("w8_hif8", "w8a8_hif8"):
+        return True
+
     if module.in_features % config.group_size != 0:
         logger.warning(
             f"Skipping {name}: in_features={module.in_features} not divisible by group_size={config.group_size}"
@@ -84,13 +88,36 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
     return True
 
 
+def _replace_modules(
+    model: nn.Module,
+    config: QATConfig,
+    factory: Callable[[nn.Linear], nn.Module],
+    target_cls: type,
+    mode_label: str,
+) -> int:
+    """Find nn.Linear layers and replace them using factory(target_cls).
+    Shared logic for both HiF8 and NVFP4 QAT paths — avoids code duplication.
+    """
+    modules_to_replace = [
+        (name, module)
+        for name, module in model.named_modules()
+        if _should_quantize(name, module, config) and not isinstance(module, target_cls)
+    ]
+
+    logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to {mode_label}")
+
+    for name, module in modules_to_replace:
+        _set_module(model, name, factory(module))
+
+    logger.info(f"Successfully applied {mode_label} to {len(modules_to_replace)} layers")
+    return len(modules_to_replace)
+
+
 def apply_qat(
     model: nn.Module,
     config: QATConfig | dict[str, Any],
 ) -> nn.Module:
     """Apply QAT to a model by replacing nn.Linear with QATLinear."""
-    from verl.utils.qat.linear import QATLinear, QATMode
-
     if not isinstance(config, QATConfig):
         config = QATConfig(**config)
 
@@ -98,32 +125,49 @@ def apply_qat(
         logger.info("QAT is disabled, returning original model")
         return model
 
+    if config.mode in ("w8_hif8", "w8a8_hif8"):
+        from verl.utils.qat.linear import HIF8QATLinear
+
+        quantize_act = (config.mode == "w8a8_hif8")
+        granularity = getattr(config, "granularity", "per_tensor")
+        group_size = getattr(config, "group_size", 32)
+        logger.info(f"Applying QAT with mode={config.mode} "
+                     f"({'W8A8' if quantize_act else 'W8 weight-only'}, "
+                     f"granularity={granularity}, group_size={group_size})")
+
+        def _hif8_factory(linear: nn.Linear) -> HIF8QATLinear:
+            return HIF8QATLinear.from_linear(
+                linear, quantize_activation=quantize_act,
+                granularity=granularity, group_size=group_size)
+
+        _replace_modules(
+            model, config,
+            factory=_hif8_factory,
+            target_cls=HIF8QATLinear,
+            mode_label=f"HiF8 QAT ({config.mode}, {granularity})",
+        )
+        return model
+
+    # Standard NVFP4 QAT path
+    from verl.utils.qat.linear import QATLinear, QATMode
+
     mode = QATMode(config.mode.lower())
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
 
-    modules_to_replace = []
-    for name, module in model.named_modules():
-        if _should_quantize(name, module, config):
-            modules_to_replace.append((name, module))
-
-    logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to QAT")
-
-    converted_count = 0
-    for name, module in modules_to_replace:
-        if isinstance(module, QATLinear):
-            continue
-
-        fake_quant_module = QATLinear.from_linear(
-            module,
+    def _factory(linear: nn.Linear) -> QATLinear:
+        return QATLinear.from_linear(
+            linear,
             mode=mode,
             group_size=config.group_size,
             activation_observer=config.activation_observer,
         )
 
-        _set_module(model, name, fake_quant_module)
-        converted_count += 1
-
-    logger.info(f"Successfully applied QAT to {converted_count} layers")
+    _replace_modules(
+        model, config,
+        factory=_factory,
+        target_cls=QATLinear,
+        mode_label=f"QAT ({mode.value})",
+    )
 
     return model
 
