@@ -94,14 +94,19 @@ def _replace_modules(
     factory: Callable[[nn.Linear], nn.Module],
     target_cls: type,
     mode_label: str,
+    skip_ids: Optional[set[int]] = None,
 ) -> int:
     """Find nn.Linear layers and replace them using factory(target_cls).
     Shared logic for both HiF8 and NVFP4 QAT paths — avoids code duplication.
     """
+    if skip_ids is None:
+        skip_ids = set()
     modules_to_replace = [
         (name, module)
         for name, module in model.named_modules()
-        if _should_quantize(name, module, config) and not isinstance(module, target_cls)
+        if _should_quantize(name, module, config)
+        and not isinstance(module, target_cls)
+        and id(module) not in skip_ids
     ]
 
     logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to {mode_label}")
@@ -135,6 +140,21 @@ def apply_qat(
                      f"({'W8A8' if quantize_act else 'W8 weight-only'}, "
                      f"granularity={granularity}, group_size={group_size})")
 
+        # Patch MoE blocks FIRST so expert Linear layers under them can be
+        # excluded from individual HIF8QATLinear replacement.
+        from verl.utils.qat.moe import apply_hif8_qat_to_moe
+
+        moe_patched = apply_hif8_qat_to_moe(
+            model, granularity=granularity, group_size=group_size,
+            quantize_activation=quantize_act)
+
+        # Collect module ids under MoE blocks to skip redundant Linear
+        # replacement (MoE forwards bypass Linear.forward anyway).
+        if moe_patched > 0:
+            moe_child_ids = _collect_moe_child_ids(model)
+        else:
+            moe_child_ids = set()
+
         def _hif8_factory(linear: nn.Linear) -> HIF8QATLinear:
             return HIF8QATLinear.from_linear(
                 linear, quantize_activation=quantize_act,
@@ -145,7 +165,9 @@ def apply_qat(
             factory=_hif8_factory,
             target_cls=HIF8QATLinear,
             mode_label=f"HiF8 QAT ({config.mode}, {granularity})",
+            skip_ids=moe_child_ids,
         )
+
         return model
 
     # Standard NVFP4 QAT path
@@ -170,6 +192,34 @@ def apply_qat(
     )
 
     return model
+
+
+def _collect_moe_child_ids(model: nn.Module) -> set[int]:
+    """Collect module ids that are descendants of HiF8-patched MoE blocks.
+
+    After apply_hif8_qat_to_moe() sets ``_hif8_qat_config`` on MoE blocks,
+    we traverse named_modules() so any module whose ancestor (determined
+    purely from the dotted name prefix) is a patched MoE block is collected.
+    This allows _replace_modules to skip redundant HIF8QATLinear wrappers
+    for expert Linear layers that the MoE forward bypasses anyway.
+    """
+    moe_ids: set[int] = set()
+    moe_prefixes: list[str] = []
+    for name, module in model.named_modules():
+        if hasattr(module, "_hif8_qat_config"):
+            moe_prefixes.append(name)
+
+    if not moe_prefixes:
+        return moe_ids
+
+    # Normalise prefix to "name." or "name" so we can detect children
+    for child_name, child_module in model.named_modules():
+        for prefix in moe_prefixes:
+            if child_name == prefix or child_name.startswith(prefix + "."):
+                moe_ids.add(id(child_module))
+                break
+
+    return moe_ids
 
 
 def _set_module(model: nn.Module, name: str, new_module: nn.Module):
