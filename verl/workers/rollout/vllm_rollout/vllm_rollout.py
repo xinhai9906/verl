@@ -84,6 +84,82 @@ def _should_expand_vllm_moe_params(architectures: Optional[list[str]] = None) ->
     return architectures[0] in _MOE_EXPAND_ARCHITECTURE_WHITELIST
 
 
+# HiF8 max value: 2^15 × 1.5 = 49152 (Dot=4, E=±15, M=1bit)
+_HIF8_MAX: float = 49152.0
+
+
+def _quant_hif8_inline(x: torch.Tensor) -> torch.Tensor:
+    """Per-element HiF8 tapered-precision quant, matching _quant_hif8 in vllm-ascend."""
+    x_unsigned = x.abs()
+    sign = x.sign()
+    eps = x_unsigned.amax().clamp(min=1e-30) * 1e-8
+    e = torch.floor(torch.log2(x_unsigned + eps))
+    abse = e.abs()
+    mant_bits = torch.where(
+        abse <= 3, 3.0,
+        torch.where(abse <= 7, 2.0,
+                    torch.where(abse <= 15, 1.0, 0.0)))
+    q = torch.floor(x_unsigned * 2.0 ** (-e + mant_bits) + 0.5)
+    return q * 2.0 ** (e - mant_bits) * sign
+
+
+def _hif8_fake_quant_inline(
+    tensor: torch.Tensor, granularity: str = "per_tensor", group_size: int = 32
+) -> torch.Tensor:
+    """HiF8 fake quant, identical to _hif8_fake_quant in vllm-ascend.
+
+    Inlined here to avoid ``import vllm_ascend`` in the WorkerDict
+    (training) process, which can trigger NPU-related side effects.
+    """
+    if granularity == "per_group":
+        t = tensor.float()
+        dim_size = t.shape[-1]
+        pad = (group_size - dim_size % group_size) % group_size
+        if pad:
+            t = torch.nn.functional.pad(t, (0, pad))
+        t_blocks = t.unflatten(-1, (-1, group_size))
+        amax = t_blocks.abs().amax(dim=-1, keepdim=True)
+        scale = (amax / _HIF8_MAX).clamp(min=1e-12)
+        q_blocks = _quant_hif8_inline(t_blocks / scale) * scale
+        result = q_blocks.flatten(-2, -1)
+        if pad:
+            result = result[..., :dim_size]
+        return result.to(tensor.dtype)
+    elif granularity == "per_channel":
+        amax = tensor.float().abs().amax(dim=-1, keepdim=True)
+    else:
+        amax = tensor.float().abs().max()
+    scale = (amax / _HIF8_MAX).clamp(min=1e-12)
+    return (_quant_hif8_inline(tensor.float() / scale) * scale).to(tensor.dtype)
+
+
+async def _pre_quantize_weights(weights):
+    """Fake-quantize weight tensors on CPU before sending to vLLM.
+
+    This runs on the verl training worker where weights are on CPU
+    (param_offload=True), so the float32 upcast uses system RAM instead
+    of NPU HBM — avoiding OOM for large MoE models.
+
+    Only quantizes weights that the vLLM HiF8 scheme wraps (linear + MoE
+    expert weights).  Embedding, lm_head, and MoE gate layers are skipped.
+    """
+    import re
+
+    _IGNORE_PATTERNS = [
+        re.compile(r".*\.(embed_tokens|lm_head)\.weight$"),
+        re.compile(r".*\.mlp\.gate\."),
+    ]
+
+    from verl.workers.rollout.utils import ensure_async_iterator
+
+    async for name, tensor in ensure_async_iterator(weights):
+        if any(p.search(name) for p in _IGNORE_PATTERNS):
+            yield name, tensor
+        else:
+            yield name, _hif8_fake_quant_inline(tensor, "per_tensor", 32).contiguous()
+
+
+
 async def _iter_vllm_compatible_moe_params(weights):
     """Expand Transformers 5 packed MoE expert tensors to vLLM checkpoint keys.
 
@@ -246,6 +322,11 @@ class ServerAdapter(BaseRollout):
             kwargs.get("peft_config") is not None and kwargs.get("base_sync_done", False)
         ):
             weights = _iter_vllm_compatible_moe_params(weights)
+        # Pre-quantize weights on CPU before sending to vLLM.
+        # This avoids the fp32 memory spike from _hif8_fake_quant on NPU,
+        # which OOMs for large MoE models.  vLLM receives already-quantized
+        # bf16 weights and stores them directly — no second copy needed.
+        weights = _pre_quantize_weights(weights)
         await sender.async_send_weights(weights)
 
         if future is not None:
