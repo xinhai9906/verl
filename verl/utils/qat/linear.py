@@ -456,7 +456,11 @@ def hif8_fake_quant(
 class HIF8FakeQuantFunction(torch.autograd.Function):
     """HiF8 QAT: configurable granularity → tapered precision roundtrip.
     Forward:  scale = amax/49152 → _quant_hif8 → ×scale
-    Backward: same granularity → scale = amax/49152 → _quant_hif8 → ×scale
+    Backward: STE (Straight-Through Estimator) — gradient passes through unchanged.
+        This is the standard QAT convention: forward sees quantized values so
+        the loss captures quant-error; backward uses raw gradients so weight
+        updates are full-precision.  Quantizing the gradient would inject noise
+        without helping the weights adapt to forward quant-error.
     """
 
     @staticmethod
@@ -464,14 +468,11 @@ class HIF8FakeQuantFunction(torch.autograd.Function):
         ctx, tensor: torch.Tensor,
         granularity: str = "per_tensor", group_size: int = 32
     ) -> torch.Tensor:
-        ctx.granularity = granularity
-        ctx.group_size = group_size
         return hif8_fake_quant(tensor, granularity, group_size).to(tensor.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
-        return (hif8_fake_quant(grad_output, ctx.granularity, ctx.group_size)
-                .to(grad_output.dtype), None, None)
+        return grad_output, None, None
 
 
 class HIF8QATLinear(nn.Linear):
