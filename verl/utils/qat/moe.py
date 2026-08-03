@@ -192,7 +192,8 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
     def qat_forward(self, hidden_states):
         if quantize_act:
             hidden_states = HIF8FakeQuantFunction.apply(
-                hidden_states, granularity, group_size)
+                hidden_states, granularity, group_size
+            ).contiguous()
 
         experts = self.experts
         expert_list = list(experts.children())
@@ -203,6 +204,7 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
         # autograd node.  The NPU forward accesses `.weight` and receives
         # the quantized Tensor, so the graph becomes:
         #   raw_weight → HIF8FakeQuant → stacked → GMM → output
+        # .contiguous() ensures layout compatibility with NPU GMM kernels.
         quantized_weights: dict[str, torch.Tensor] = {}
         for ei, expert in enumerate(expert_list):
             for pn in proj_names:
@@ -210,15 +212,19 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
                 if isinstance(proj, torch.nn.Linear):
                     quantized_weights[f"{ei}.{pn}"] = (
                         HIF8FakeQuantFunction.apply(
-                            proj.weight, granularity, group_size))
+                            proj.weight, granularity, group_size
+                        ).contiguous())
 
-        # Temporarily swap .weight to point to quantized tensors
+        # Temporarily swap .weight to point to quantized tensors.
+        # PyTorch __setattr__ rejects assigning a plain Tensor where an
+        # nn.Parameter is registered, so we pop from _parameters first.
         saved: dict[str, torch.nn.Parameter] = {}
         for key, qw in quantized_weights.items():
             ei_str, pn = key.split(".")
             proj = getattr(expert_list[int(ei_str)], pn)
             saved[key] = proj.weight
-            proj.weight = qw  # parameter becomes a Tensor; autograd is fine
+            proj._parameters.pop("weight", None)
+            proj.weight = qw
 
         try:
             return orig_forward(hidden_states)
@@ -226,7 +232,11 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
             for key, orig_param in saved.items():
                 ei_str, pn = key.split(".")
                 proj = getattr(expert_list[int(ei_str)], pn)
-                proj.weight = orig_param
+                try:
+                    delattr(proj, "weight")
+                except AttributeError:
+                    pass
+                proj.register_parameter("weight", orig_param)
 
     return qat_forward
 
@@ -255,17 +265,25 @@ def _make_stacked_param_qat_forward(
             param = getattr(target, attr, None)
             if isinstance(param, torch.nn.Parameter):
                 saved[attr] = param
+                # Pop from _parameters so PyTorch allows a plain Tensor
+                target._parameters.pop(attr, None)
                 setattr(target, attr,
                         HIF8FakeQuantFunction.apply(
-                            param, granularity, group_size))
+                            param, granularity, group_size
+                        ).contiguous())
 
         try:
             if quantize_act and args:
                 args = (HIF8FakeQuantFunction.apply(
-                    args[0], granularity, group_size),) + args[1:]
+                    args[0], granularity, group_size
+                ).contiguous(),) + args[1:]
             return orig_forward(*args, **kwargs)
         finally:
             for attr, orig_param in saved.items():
-                setattr(target, attr, orig_param)
+                try:
+                    delattr(target, attr)
+                except AttributeError:
+                    pass
+                target.register_parameter(attr, orig_param)
 
     return qat_forward

@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""QAT FakeQuantized Linear module for NVFP4 (W4A4/W4A16) with FSDP compatibility.
+"""QAT FakeQuantized Linear module for NVFP4 (W4A4/W4A16) and Ascend HiF8 (W8/W8A8).
 
-Includes Triton kernels for high-performance FP4 quantization.
+Includes Triton kernels for high-performance FP4 quantization, and pure-PyTorch
+tapered-precision quantization for HiF8 on Ascend NPU.
 """
 
 from enum import Enum
@@ -395,7 +396,7 @@ class QATLinear(nn.Linear):
 # Granularity modes:
 #   per_tensor:  one scale per tensor (weight: scalar, activation: scalar)
 #   per_channel: one scale per output channel (weight: (out,1), activation: per-token)
-#   per_group:   one scale per group of 32 elements along last dim
+#   per_group:   one scale per `group_size` elements along last dim
 # ============================================================================
 
 
@@ -528,8 +529,8 @@ class HIF8QATLinear(nn.Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight_fq = HIF8FakeQuantFunction.apply(
-            self.weight, self.granularity, self.group_size)
+            self.weight, self.granularity, self.group_size).contiguous()
         if self.quantize_activation:
             x = HIF8FakeQuantFunction.apply(
-                x, self.granularity, self.group_size)
+                x, self.granularity, self.group_size).contiguous()
         return F.linear(x, weight_fq, self.bias)

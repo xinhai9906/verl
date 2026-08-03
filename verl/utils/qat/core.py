@@ -122,7 +122,11 @@ def apply_qat(
     model: nn.Module,
     config: QATConfig | dict[str, Any],
 ) -> nn.Module:
-    """Apply QAT to a model by replacing nn.Linear with QATLinear."""
+    """Apply QAT to a model.
+    HiF8 modes: replaces nn.Linear with HIF8QATLinear and monkey-patches
+    MoE block forward methods for expert weight quantization.
+    NVFP4 modes: replaces nn.Linear with QATLinear and sets up fusion siblings.
+    """
     if not isinstance(config, QATConfig):
         config = QATConfig(**config)
 
