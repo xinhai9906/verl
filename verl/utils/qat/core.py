@@ -38,6 +38,11 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    probe_quant_error: bool = False  # Enable per-layer HiF8 quant-error probe (pure measurement, no noise)
+    probe_output_path: Optional[str] = None  # JSONL output path for probe reports (None = log only)
+    rotation_enable: bool = False  # Apply block Hadamard rotation before quantisation
+    rotation_block_size: int = 32  # Rotation block size (must equal group_size for per_group)
+    rotation_seed: int = 0  # Random sign seed for the rotation matrix
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
@@ -91,12 +96,12 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
 def _replace_modules(
     model: nn.Module,
     config: QATConfig,
-    factory: Callable[[nn.Linear], nn.Module],
+    factory: Callable[[nn.Linear, str], nn.Module],
     target_cls: type,
     mode_label: str,
     skip_ids: Optional[set[int]] = None,
 ) -> int:
-    """Find nn.Linear layers and replace them using factory(target_cls).
+    """Find nn.Linear layers and replace them using ``factory(module, name)``.
     Shared logic for both HiF8 and NVFP4 QAT paths — avoids code duplication.
     """
     if skip_ids is None:
@@ -112,7 +117,7 @@ def _replace_modules(
     logger.info(f"Found {len(modules_to_replace)} Linear layers to convert to {mode_label}")
 
     for name, module in modules_to_replace:
-        _set_module(model, name, factory(module))
+        _set_module(model, name, factory(module, name))
 
     logger.info(f"Successfully applied {mode_label} to {len(modules_to_replace)} layers")
     return len(modules_to_replace)
@@ -136,13 +141,23 @@ def apply_qat(
 
     if config.mode in ("w8_hif8", "w8a8_hif8"):
         from verl.utils.qat.linear import HIF8QATLinear
+        from verl.utils.qat.probe import configure_qat_probe
 
         quantize_act = (config.mode == "w8a8_hif8")
         granularity = getattr(config, "granularity", "per_tensor")
         group_size = getattr(config, "group_size", 32)
+        probe_enabled = getattr(config, "probe_quant_error", False)
+        probe_output = getattr(config, "probe_output_path", None)
+
+        if probe_enabled:
+            configure_qat_probe(enabled=True, output_path=probe_output)
+
         logger.info(f"Applying QAT with mode={config.mode} "
                      f"({'W8A8' if quantize_act else 'W8 weight-only'}, "
-                     f"granularity={granularity}, group_size={group_size})")
+                     f"granularity={granularity}, group_size={group_size}, "
+                     f"probe={probe_enabled}, "
+                     f"rotation={config.rotation_enable} "
+                     f"(block_size={config.rotation_block_size}, seed={config.rotation_seed}))")
 
         # Patch MoE blocks FIRST so expert Linear layers under them can be
         # excluded from individual HIF8QATLinear replacement.
@@ -150,7 +165,11 @@ def apply_qat(
 
         moe_patched = apply_hif8_qat_to_moe(
             model, granularity=granularity, group_size=group_size,
-            quantize_activation=quantize_act)
+            quantize_activation=quantize_act,
+            probe_quant_error=probe_enabled,
+            rotation_enable=config.rotation_enable,
+            rotation_block_size=config.rotation_block_size,
+            rotation_seed=config.rotation_seed)
 
         # Collect module ids under MoE blocks to skip redundant Linear
         # replacement (MoE forwards bypass Linear.forward anyway).
@@ -159,10 +178,15 @@ def apply_qat(
         else:
             moe_child_ids = set()
 
-        def _hif8_factory(linear: nn.Linear) -> HIF8QATLinear:
+        def _hif8_factory(linear: nn.Linear, name: str = "") -> HIF8QATLinear:
             return HIF8QATLinear.from_linear(
                 linear, quantize_activation=quantize_act,
-                granularity=granularity, group_size=group_size)
+                granularity=granularity, group_size=group_size,
+                hif8_probe_quant_error=probe_enabled,
+                rotation_enable=config.rotation_enable,
+                rotation_block_size=config.rotation_block_size,
+                rotation_seed=config.rotation_seed,
+                layer_name=name)
 
         _replace_modules(
             model, config,
@@ -180,7 +204,7 @@ def apply_qat(
     mode = QATMode(config.mode.lower())
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
 
-    def _factory(linear: nn.Linear) -> QATLinear:
+    def _factory(linear: nn.Linear, name: str = "") -> QATLinear:
         return QATLinear.from_linear(
             linear,
             mode=mode,

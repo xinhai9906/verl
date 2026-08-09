@@ -27,19 +27,29 @@ gradients flow: output → GMM → quant_weight → HIF8FakeQuant.backward → r
 
 When quantize_activation=True (w8a8 mode), the input hidden_states are also
 HiF8 pseudo-quantized before being fed to the GMM kernel.
+
+When probe_quant_error=True, the patched forward computes per-expert quantisation
+error via :func:`_hif8_compute_quant_error` (under ``torch.no_grad()``) and
+records it with the shared :class:`QATProbeRecorder`, then runs the original
+un-quantized forward — matching the Dense HIF8QATLinear probe behaviour.
 """
 
 import logging
+import re
 import types
 from typing import Optional
 
 import torch
+import torch.nn as nn
 
-from verl.utils.qat.linear import HIF8FakeQuantFunction
+from verl.utils.qat.linear import HIF8FakeQuantFunction, _hif8_compute_quant_error
+from verl.utils.qat.probe import get_qat_probe_recorder
+from verl.utils.qat.block_rotation import BlockRotationConfig, apply_block_rotation
 
 logger = logging.getLogger(__name__)
 
 _QAT_CONFIG_ATTR = "_hif8_qat_config"
+_MOE_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 
 
 def apply_hif8_qat_to_moe(
@@ -47,6 +57,11 @@ def apply_hif8_qat_to_moe(
     granularity: str = "per_tensor",
     group_size: int = 32,
     quantize_activation: bool = False,
+    probe_quant_error: bool = False,
+    rotation_enable: bool = False,
+    rotation_block_size: int = 32,
+    rotation_seed: int = 0,
+    probe_layer_names: Optional[dict[int, str]] = None,
 ) -> int:
     """Apply HiF8 QAT to all MoE blocks in the model.
 
@@ -57,14 +72,37 @@ def apply_hif8_qat_to_moe(
     When quantize_activation=True (w8a8 mode), the input hidden_states are also
     HiF8 pseudo-quantized before being fed to the GMM kernel.
 
+    When probe_quant_error=True, the patched forward runs the original
+    un-quantized forward while computing per-weight quantisation MAE via
+    ``torch.no_grad()`` and recording it with the shared QATProbeRecorder.
+
+    Args:
+        probe_quant_error: Enable per-expert quant-error probing (default False).
+        rotation_enable: Apply block Hadamard rotation before quantisation.
+        rotation_block_size: Rotation block size (must equal group_size for per_group).
+        rotation_seed: Random sign seed for the rotation matrix.
+        probe_layer_names: Optional mapping ``{id(module): layer_name}`` for
+            populating ``layer_type`` / ``layer_index`` in probe reports.
+
     Returns:
         int: Number of MoE blocks patched.
     """
     patched_count = 0
-    qat_cfg = {
+    probe_layer_names = probe_layer_names or {}
+    rotation_config = BlockRotationConfig(
+        enable=rotation_enable, block_size=rotation_block_size, seed=rotation_seed
+    )
+    if granularity == "per_group" and rotation_enable and rotation_block_size != group_size:
+        raise ValueError(
+            f"per_group rotation requires block_size == group_size={group_size}, "
+            f"got rotation_block_size={rotation_block_size}"
+        )
+    base_cfg = {
         "granularity": granularity,
         "group_size": group_size,
         "quantize_activation": quantize_activation,
+        "probe_quant_error": probe_quant_error,
+        "rotation_config": rotation_config,
     }
 
     # Collect all MoE block candidates
@@ -88,14 +126,20 @@ def apply_hif8_qat_to_moe(
                 "[HiF8 MoE QAT] Skipping %s (parent is already patched)", name)
             continue
 
+        # Per-block config copy so each block gets its own layer_name
+        layer_name = probe_layer_names.get(id(module), name)
+        qat_cfg = dict(base_cfg, layer_name=layer_name)
+        qat_cfg["layer_type"] = _infer_moe_layer_type(name)
+        qat_cfg["layer_index"] = _infer_moe_layer_index(name)
+
         setattr(module, _QAT_CONFIG_ATTR, qat_cfg)
         _patch_moe_forward(module, moe_type, qat_cfg)
         patched_count += 1
 
     logger.info(
         "[HiF8 MoE QAT] Patched %d MoE blocks "
-        "(granularity=%s, group_size=%d, quantize_activation=%s)",
-        patched_count, granularity, group_size, quantize_activation,
+        "(granularity=%s, group_size=%d, quantize_activation=%s, probe=%s)",
+        patched_count, granularity, group_size, quantize_activation, probe_quant_error,
     )
     return patched_count
 
@@ -106,6 +150,47 @@ def _ancestor_prefixes(full_name: str) -> list[str]:
     """
     parts = full_name.split(".")
     return [".".join(parts[:i]) for i in range(1, len(parts))]
+
+
+def _infer_moe_layer_type(name: str) -> Optional[str]:
+    """Infer MoE layer type from the dotted module name."""
+    if name.endswith(".experts"):
+        parent = name.rsplit(".", 2)[0] if name.count(".") >= 2 else name
+        return parent.rsplit(".", 1)[-1] if "." in parent else parent
+    return None
+
+
+def _infer_moe_layer_index(name: str) -> Optional[int]:
+    """Infer layer index from the dotted module name."""
+    match = _MOE_LAYER_IDX_RE.search(name)
+    return int(match.group(1)) if match else None
+
+
+def _record_moe_quant_error(
+    qat_cfg: dict, error_type: str, error_sum: float, element_count: int
+) -> None:
+    """Record one quant-error measurement for an MoE expert weight."""
+    recorder = get_qat_probe_recorder()
+    recorder.record(
+        meta={
+            "step": recorder.current_step,
+            "error_type": error_type,
+            "layer_index": qat_cfg.get("layer_index"),
+            "layer_type": qat_cfg.get("layer_type"),
+            "mode": (
+                "w8a8_hif8" if qat_cfg.get("quantize_activation") else "w8a16_hif8"
+            ),
+            "granularity": qat_cfg.get("granularity"),
+            "group_size": qat_cfg.get("group_size"),
+            "rank": (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            ),
+        },
+        error_sum=error_sum,
+        element_count=element_count,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,41 +268,72 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
     by temporarily replacing each expert Linear.weight with a quantized version
     *as a regular Tensor* that is part of the autograd graph — the original
     Parameter stays intact.
+
+    When probe_quant_error=True, no weights are replaced; the original forward
+    runs unmodified while per-expert quantisation MAE is computed under
+    ``torch.no_grad()`` and recorded via :func:`_record_moe_quant_error`.
     """
 
     granularity = qat_cfg["granularity"]
     group_size = qat_cfg["group_size"]
     quantize_act = qat_cfg.get("quantize_activation", False)
+    probe_enabled = qat_cfg.get("probe_quant_error", False)
+    rotation_config = qat_cfg.get("rotation_config", BlockRotationConfig())
 
     def qat_forward(self, hidden_states):
-        if quantize_act:
-            hidden_states = HIF8FakeQuantFunction.apply(
-                hidden_states, granularity, group_size
-            ).contiguous()
-
         experts = self.experts
         expert_list = list(experts.children())
         proj_names = ("gate_proj", "up_proj", "down_proj")
 
-        # Build quantized weight dict: for each expert Linear, create a
-        # quantized *Tensor* (not Parameter) that carries the HIF8FakeQuant
-        # autograd node.  The NPU forward accesses `.weight` and receives
-        # the quantized Tensor, so the graph becomes:
-        #   raw_weight → HIF8FakeQuant → stacked → GMM → output
-        # .contiguous() ensures layout compatibility with NPU GMM kernels.
+        # -- probe mode: measure error, run original forward -----------------
+        if probe_enabled:
+            for ei, expert in enumerate(expert_list):
+                for pn in proj_names:
+                    proj = getattr(expert, pn, None)
+                    if isinstance(proj, nn.Linear):
+                        rotated_w = apply_block_rotation(
+                            proj.weight, rotation_config
+                        )
+                        err_sum, err_n = _hif8_compute_quant_error(
+                            rotated_w, granularity, group_size
+                        )
+                        _record_moe_quant_error(
+                            qat_cfg,
+                            f"weight/{pn}",
+                            err_sum,
+                            err_n,
+                        )
+            if quantize_act:
+                rotated_a = apply_block_rotation(
+                    hidden_states, rotation_config
+                )
+                a_err, a_n = _hif8_compute_quant_error(
+                    rotated_a, granularity, group_size
+                )
+                _record_moe_quant_error(qat_cfg, "activation", a_err, a_n)
+            return orig_forward(hidden_states)
+
+        # -- normal QAT: pseudo-quantize weights via STE ----------------------
+        if quantize_act:
+            rotated_h = apply_block_rotation(hidden_states, rotation_config)
+            hidden_states = HIF8FakeQuantFunction.apply(
+                rotated_h, granularity, group_size
+            ).contiguous()
+
         quantized_weights: dict[str, torch.Tensor] = {}
         for ei, expert in enumerate(expert_list):
             for pn in proj_names:
                 proj = getattr(expert, pn, None)
-                if isinstance(proj, torch.nn.Linear):
+                if isinstance(proj, nn.Linear):
+                    rotated_w = apply_block_rotation(
+                        proj.weight, rotation_config
+                    )
                     quantized_weights[f"{ei}.{pn}"] = (
                         HIF8FakeQuantFunction.apply(
-                            proj.weight, granularity, group_size
+                            rotated_w, granularity, group_size
                         ).contiguous())
 
         # Temporarily swap .weight to point to quantized tensors.
-        # PyTorch __setattr__ rejects assigning a plain Tensor where an
-        # nn.Parameter is registered, so we pop from _parameters first.
         saved: dict[str, torch.nn.Parameter] = {}
         for key, qw in quantized_weights.items():
             ei_str, pn = key.split(".")
@@ -253,29 +369,66 @@ def _make_stacked_param_qat_forward(
 
     The NPU forward calls NPUGmmFunction or torch.bmm with these parameters.
     We intercept by temporarily replacing them with quantized Tensors.
+
+    When probe_quant_error=True, no parameters are replaced; the original forward
+    runs unmodified while per-expert quantisation MAE is computed (each expert
+    slice of the stacked Parameter is measured independently).
     """
     granularity = qat_cfg["granularity"]
     group_size = qat_cfg["group_size"]
     quantize_act = qat_cfg.get("quantize_activation", False)
+    probe_enabled = qat_cfg.get("probe_quant_error", False)
+    rotation_config = qat_cfg.get("rotation_config", BlockRotationConfig())
 
     def qat_forward(self, *args, **kwargs):
         target = self if is_self else self.experts
+
+        # -- probe mode: measure error per expert, run original forward --------
+        if probe_enabled:
+            for attr in ("gate_up_proj", "down_proj"):
+                param = getattr(target, attr, None)
+                if isinstance(param, nn.Parameter) and param.ndim >= 2:
+                    for e in range(param.shape[0]):
+                        rotated_w = apply_block_rotation(
+                            param[e], rotation_config
+                        )
+                        err_sum, err_n = _hif8_compute_quant_error(
+                            rotated_w, granularity, group_size
+                        )
+                        _record_moe_quant_error(
+                            qat_cfg,
+                            f"weight/{attr}/expert_{e}",
+                            err_sum,
+                            err_n,
+                        )
+            if quantize_act and args:
+                rotated_a = apply_block_rotation(
+                    args[0], rotation_config
+                )
+                a_err, a_n = _hif8_compute_quant_error(
+                    rotated_a, granularity, group_size
+                )
+                _record_moe_quant_error(qat_cfg, "activation", a_err, a_n)
+            return orig_forward(*args, **kwargs)
+
+        # -- normal QAT: pseudo-quantize weights via STE -----------------------
         saved: dict[str, torch.nn.Parameter] = {}
         for attr in ("gate_up_proj", "down_proj"):
             param = getattr(target, attr, None)
             if isinstance(param, torch.nn.Parameter):
                 saved[attr] = param
-                # Pop from _parameters so PyTorch allows a plain Tensor
+                rotated = apply_block_rotation(param, rotation_config)
                 target._parameters.pop(attr, None)
                 setattr(target, attr,
                         HIF8FakeQuantFunction.apply(
-                            param, granularity, group_size
+                            rotated, granularity, group_size
                         ).contiguous())
 
         try:
             if quantize_act and args:
+                rotated_h = apply_block_rotation(args[0], rotation_config)
                 args = (HIF8FakeQuantFunction.apply(
-                    args[0], granularity, group_size
+                    rotated_h, granularity, group_size
                 ).contiguous(),) + args[1:]
             return orig_forward(*args, **kwargs)
         finally:

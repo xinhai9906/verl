@@ -18,6 +18,8 @@ Includes Triton kernels for high-performance FP4 quantization, and pure-PyTorch
 tapered-precision quantization for HiF8 on Ascend NPU.
 """
 
+import logging
+import re
 from enum import Enum
 from typing import Optional
 
@@ -25,7 +27,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from verl.utils.qat.probe import get_qat_probe_recorder
+from verl.utils.qat.block_rotation import BlockRotationConfig, apply_block_rotation
+
 __all__ = ["QATLinear", "QATMode", "HIF8QATLinear", "HIF8FakeQuantFunction"]
+
+logger = logging.getLogger(__name__)
+_HIF8_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
 
 
 import triton
@@ -476,15 +484,57 @@ class HIF8FakeQuantFunction(torch.autograd.Function):
         return grad_output, None, None
 
 
+def _hif8_compute_quant_error(
+    tensor: torch.Tensor, granularity: str, group_size: int
+) -> tuple[float, int]:
+    """Compute quantisation roundtrip error without building an autograd graph.
+
+    Uses :func:`hif8_fake_quant` under ``torch.no_grad()`` so no STE hook or
+    intermediate graph nodes are created — safe (and cheap) for probe mode
+    where the fake-quant result is never used in the forward computation.
+
+    Returns
+    -------
+    error_sum:
+        ``sum(|original_f32 - fake_quant_f32|)``
+    element_count:
+        ``tensor.numel()``
+    """
+    tensor_f32 = tensor.detach().float()
+    with torch.no_grad():
+        fake_quant = hif8_fake_quant(tensor, granularity, group_size).float()
+    diff = (fake_quant - tensor_f32).abs()
+    return diff.sum().item(), tensor.numel()
+
+
 class HIF8QATLinear(nn.Linear):
     """HiF8 FakeQuantized Linear — configurable granularity + activation.
-    granularity='per_tensor':  one scale per tensor
-    granularity='per_channel': one scale per output channel (weight) / token (act)
-    granularity='per_group':   one scale per group of group_size elements
-    quantize_activation=False: W8 (weight-only)
-    quantize_activation=True:  W8A8 (full)
+
+    Parameters
+    ----------
+    granularity:
+        ``"per_tensor"``   one scale per tensor
+        ``"per_channel"``  one scale per output channel (weight) / token (act)
+        ``"per_group"``    one scale per group of ``group_size`` elements
+    quantize_activation:
+        ``False`` – W8 (weight-only)
+        ``True``  – W8A8 (full)
+    hif8_probe_quant_error:
+        When ``True``, forward returns the **original** (un-quantized) result
+        while recording per-layer MAE between the fake-quant roundtrip and the
+        original tensor.  This lets you measure quant sensitivity without
+        polluting training.
+    rotation_enable / rotation_block_size / rotation_seed:
+        Apply block-Hadamard-sign rotation before quantisation to spread
+        outliers across each *block_size*-element group.  ``per_group``
+        granularity mandates ``rotation_block_size == group_size``.
+    layer_name / layer_type / layer_index:
+        Metadata for probe reports.  Auto-inferred from ``layer_name`` when
+        omitted.
     FSDP-compatible (standard nn.Parameter, no extra state).
     """
+
+    _is_verl_qat_linear = True
 
     def __init__(
         self,
@@ -494,6 +544,13 @@ class HIF8QATLinear(nn.Linear):
         quantize_activation: bool = False,
         granularity: str = "per_tensor",
         group_size: int = 32,
+        hif8_probe_quant_error: bool = False,
+        rotation_enable: bool = False,
+        rotation_block_size: int = 32,
+        rotation_seed: int = 0,
+        layer_name: Optional[str] = None,
+        layer_type: Optional[str] = None,
+        layer_index: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -501,13 +558,36 @@ class HIF8QATLinear(nn.Linear):
         self.quantize_activation = quantize_activation
         self.granularity = granularity
         self.group_size = group_size
+        self.hif8_probe_quant_error = hif8_probe_quant_error
+        self.fake_quant_enabled = True
+        if granularity == "per_group" and rotation_enable and rotation_block_size != group_size:
+            raise ValueError(
+                f"per_group rotation requires block_size == group_size={group_size}, "
+                f"got rotation_block_size={rotation_block_size}"
+            )
+        self.rotation_config = BlockRotationConfig(
+            enable=rotation_enable,
+            block_size=rotation_block_size,
+            seed=rotation_seed,
+        )
+        self._hif8_layer_name = layer_name
+        self._hif8_layer_type = layer_type or _infer_hif8_layer_type(layer_name)
+        self._hif8_layer_index = layer_index if layer_index is not None else _infer_hif8_layer_index(layer_name)
 
     @classmethod
     def from_linear(
-        cls, linear: nn.Linear,
+        cls,
+        linear: nn.Linear,
         quantize_activation: bool = False,
         granularity: str = "per_tensor",
         group_size: int = 32,
+        hif8_probe_quant_error: bool = False,
+        rotation_enable: bool = False,
+        rotation_block_size: int = 32,
+        rotation_seed: int = 0,
+        layer_name: Optional[str] = None,
+        layer_type: Optional[str] = None,
+        layer_index: Optional[int] = None,
     ) -> "HIF8QATLinear":
         """Create HIF8QATLinear from an existing nn.Linear, copying weights."""
         has_bias = linear.bias is not None
@@ -518,6 +598,13 @@ class HIF8QATLinear(nn.Linear):
             quantize_activation=quantize_activation,
             granularity=granularity,
             group_size=group_size,
+            hif8_probe_quant_error=hif8_probe_quant_error,
+            rotation_enable=rotation_enable,
+            rotation_block_size=rotation_block_size,
+            rotation_seed=rotation_seed,
+            layer_name=layer_name,
+            layer_type=layer_type,
+            layer_index=layer_index,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
         )
@@ -527,10 +614,92 @@ class HIF8QATLinear(nn.Linear):
                 new_linear.bias = nn.Parameter(linear.bias.clone())
         return new_linear
 
+    def _mode_str(self) -> str:
+        return "w8a8_hif8" if self.quantize_activation else "w8a16_hif8"
+
+    def _record_quant_error(
+        self, error_type: str, error_sum: float, element_count: int
+    ) -> None:
+        """Record one quant-error measurement via the shared probe recorder."""
+        recorder = get_qat_probe_recorder()
+        recorder.record(
+            meta={
+                "step": recorder.current_step,
+                "error_type": error_type,
+                "layer_index": self._hif8_layer_index,
+                "layer_type": self._hif8_layer_type,
+                "mode": self._mode_str(),
+                "granularity": self.granularity,
+                "group_size": self.group_size,
+                "rank": (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_available() and torch.distributed.is_initialized()
+                    else 0
+                ),
+            },
+            error_sum=error_sum,
+            element_count=element_count,
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fast path: no fake quant at all (rotation is also skipped)
+        if not self.fake_quant_enabled:
+            return F.linear(x, self.weight, self.bias)
+
+        # Apply block rotation before quantisation so that the quant error is
+        # measured on the rotated tensors — matching what real quant inference
+        # would see after rotation.
+        rotated_weight = apply_block_rotation(self.weight, self.rotation_config)
+        rotated_x = apply_block_rotation(x, self.rotation_config)
+
+        # -- probe mode: measure error on rotated tensors, return original -----
+        if self.hif8_probe_quant_error:
+            w_err, w_n = _hif8_compute_quant_error(
+                rotated_weight, self.granularity, self.group_size
+            )
+            self._record_quant_error("weight", w_err, w_n)
+
+            if self.quantize_activation:
+                a_err, a_n = _hif8_compute_quant_error(
+                    rotated_x, self.granularity, self.group_size
+                )
+                self._record_quant_error("activation", a_err, a_n)
+
+            return F.linear(x, self.weight, self.bias)
+
+        # -- normal QAT forward: inject quant noise via STE --------------------
         weight_fq = HIF8FakeQuantFunction.apply(
-            self.weight, self.granularity, self.group_size).contiguous()
+            rotated_weight, self.granularity, self.group_size
+        ).contiguous()
         if self.quantize_activation:
-            x = HIF8FakeQuantFunction.apply(
-                x, self.granularity, self.group_size).contiguous()
-        return F.linear(x, weight_fq, self.bias)
+            x_fq = HIF8FakeQuantFunction.apply(
+                rotated_x, self.granularity, self.group_size
+            ).contiguous()
+        else:
+            x_fq = rotated_x
+        return F.linear(x_fq, weight_fq, self.bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, quantize_activation={self.quantize_activation}, "
+            f"granularity={self.granularity}, group_size={self.group_size}, "
+            f"hif8_probe_quant_error={self.hif8_probe_quant_error}, "
+            f"rotation_enable={self.rotation_config.enable}, "
+            f"rotation_block_size={self.rotation_config.block_size}, "
+            f"rotation_seed={self.rotation_config.seed}, "
+            f"fake_quant_enabled={self.fake_quant_enabled}"
+        )
+
+
+def _infer_hif8_layer_type(layer_name: Optional[str]) -> Optional[str]:
+    if layer_name is None:
+        return None
+    return layer_name.rsplit(".", 1)[-1]
+
+
+def _infer_hif8_layer_index(layer_name: Optional[str]) -> Optional[int]:
+    if layer_name is None:
+        return None
+    match = _HIF8_LAYER_IDX_RE.search(layer_name)
+    return int(match.group(1)) if match else None

@@ -878,13 +878,21 @@ class vLLMHttpServer:
                 apply_qat_patches()
                 quantization = "compressed-tensors"
             elif quant_method == "ascend-hif8":
-                quantization = "ascend-hif8"
-                logger.info("QAT HiF8 quantization configured for vLLM Ascend")
+                if qat_config.probe_quant_error:
+                    logger.info(
+                        "QAT probe_quant_error=True — skipping HiF8 quantization on rollout "
+                        "to keep train/rollout precision aligned (both BF16)."
+                    )
+                    quantization = None
+                else:
+                    quantization = "ascend-hif8"
+                    logger.info("QAT HiF8 quantization configured for vLLM Ascend")
             else:
                 raise ValueError(f"Unsupported quant_method: {quant_method}")
 
             logger.info(f"QAT quantization config injected (quant_method={quant_method})")
-            hf_overrides["quantization_config"] = quantization_config_dict
+            if quantization is not None:
+                hf_overrides["quantization_config"] = quantization_config_dict
         elif quantization is not None:
             # Handle other quantization methods (fp8, torchao)
             _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
