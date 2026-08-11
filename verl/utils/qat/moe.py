@@ -173,7 +173,7 @@ def _record_moe_quant_error(
     recorder = get_qat_probe_recorder()
     recorder.record(
         meta={
-            "step": recorder.current_step,
+            "step": recorder.current_step if recorder.current_step is not None else 0,
             "error_type": error_type,
             "layer_index": qat_cfg.get("layer_index"),
             "layer_type": qat_cfg.get("layer_type"),

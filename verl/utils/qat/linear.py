@@ -624,7 +624,7 @@ class HIF8QATLinear(nn.Linear):
         recorder = get_qat_probe_recorder()
         recorder.record(
             meta={
-                "step": recorder.current_step,
+                "step": recorder.current_step if recorder.current_step is not None else 0,
                 "error_type": error_type,
                 "layer_index": self._hif8_layer_index,
                 "layer_type": self._hif8_layer_type,

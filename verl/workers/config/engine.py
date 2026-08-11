@@ -140,10 +140,13 @@ class QATEngineConfig(BaseConfig):
 
     enable: bool = False
     mode: str = "w4a16"
+    granularity: str = "per_tensor"
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    probe_quant_error: bool = False
+    probe_output_path: Optional[str] = None
 
 
 @dataclass

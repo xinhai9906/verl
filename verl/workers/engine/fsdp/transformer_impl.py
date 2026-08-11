@@ -151,6 +151,7 @@ class FSDPEngine(BaseEngine):
         # QAT (Quantization-Aware Training)
         self._qat_config = getattr(self.engine_config, "qat", None)
         self._qat_enabled = self._qat_config is not None and getattr(self._qat_config, "enable", False)
+        self._train_step_counter = 0
         if self._qat_enabled:
             logger.info(f"QAT enabled: mode={self._qat_config.mode}, group_size={self._qat_config.group_size}")
 
@@ -500,6 +501,9 @@ class FSDPEngine(BaseEngine):
                 "group_size": self._qat_config.group_size,
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
+                "granularity": getattr(self._qat_config, "granularity", "per_tensor"),
+                "probe_quant_error": getattr(self._qat_config, "probe_quant_error", False),
+                "probe_output_path": getattr(self._qat_config, "probe_output_path", None),
             },
         )
         if self._qat_config.mode not in ("w8_hif8", "w8a8_hif8"):
@@ -706,8 +710,12 @@ class FSDPEngine(BaseEngine):
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales
+            from verl.utils.qat.probe import flush_qat_probe, set_qat_probe_step
 
             invalidate_all_scales(self.module)
+            self._train_step_counter += 1
+            set_qat_probe_step(self._train_step_counter)
+            flush_qat_probe()
 
         return grad_norm.item()
 
