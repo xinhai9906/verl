@@ -512,6 +512,14 @@ class FSDPEngine(BaseEngine):
         if self._qat_config.mode == "w4a4":
             self._restore_w4a4_input_scales(module, self.model_config.local_path)
 
+        # Set initial probe step so the first forward pass is labelled step 1
+        # (configure_qat_probe resets current_step to None, so this must come after)
+        if getattr(self._qat_config, "probe_quant_error", False):
+            from verl.utils.qat.probe import set_qat_probe_step
+
+            self._train_step_counter = 1
+            set_qat_probe_step(self._train_step_counter)
+
         return module
 
     def _restore_w4a4_input_scales(self, model, model_path):
@@ -710,12 +718,11 @@ class FSDPEngine(BaseEngine):
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales
-            from verl.utils.qat.probe import flush_qat_probe, set_qat_probe_step
+            from verl.utils.qat.probe import set_qat_probe_step
 
             invalidate_all_scales(self.module)
             self._train_step_counter += 1
             set_qat_probe_step(self._train_step_counter)
-            flush_qat_probe()
 
         return grad_norm.item()
 
