@@ -161,7 +161,17 @@ class QATProbeRecorder:
                 self._atexit_registered = True
 
     def set_step(self, step: Any) -> None:
-        self.current_step = step
+        """Set the current training step, flushing previous step data if changed.
+
+        Flushing here (rather than lazily in :meth:`record`) ensures data is
+        persisted immediately at step boundaries, so the final step is not
+        lost when ``atexit`` fails to fire (e.g. process killed or file renamed
+        before exit).
+        """
+        with self._lock:
+            if self.current_step is not None and self.current_step != step:
+                self._flush_locked()
+            self.current_step = step
 
     def record(self, meta: dict, error_sum: float, element_count: int) -> None:
         """Accumulate one quant-error measurement.
