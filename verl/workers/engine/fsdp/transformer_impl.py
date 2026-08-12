@@ -512,12 +512,12 @@ class FSDPEngine(BaseEngine):
         if self._qat_config.mode == "w4a4":
             self._restore_w4a4_input_scales(module, self.model_config.local_path)
 
-        # Set initial probe step so the first forward pass is labelled step 1
+        # Set initial probe step so the first forward pass is labelled step 0
         # (configure_qat_probe resets current_step to None, so this must come after)
         if getattr(self._qat_config, "probe_quant_error", False):
             from verl.utils.qat.probe import set_qat_probe_step
 
-            self._train_step_counter = 1
+            self._train_step_counter = 0
             set_qat_probe_step(self._train_step_counter)
 
         return module
