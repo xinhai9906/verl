@@ -133,7 +133,7 @@ def _hif8_fake_quant_inline(
     return (_quant_hif8_inline(tensor.float() / scale) * scale).to(tensor.dtype)
 
 
-async def _pre_quantize_weights(weights):
+async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
     """Fake-quantize weight tensors on CPU before sending to vLLM.
 
     This runs on the verl training worker where weights are on CPU
@@ -142,6 +142,11 @@ async def _pre_quantize_weights(weights):
 
     Only quantizes weights that the vLLM HiF8 scheme wraps (linear + MoE
     expert weights).  Embedding, lm_head, and MoE gate layers are skipped.
+
+    When ``qat_config`` contains ``rotation_enable=True``, block Hadamard-sign
+    rotation is applied before fake-quant so that vLLM receives pre-rotated
+    weights — matching the QAT training forward where ``apply_block_rotation``
+    runs before ``HIF8FakeQuantFunction``.
     """
     import re
 
@@ -152,10 +157,26 @@ async def _pre_quantize_weights(weights):
 
     from verl.workers.rollout.utils import ensure_async_iterator
 
+    qat_config = qat_config or {}
+    rotation_enable = bool(qat_config.get("rotation_enable", False))
+    rotation_block_size = int(qat_config.get("rotation_block_size", 32))
+    rotation_seed = int(qat_config.get("rotation_seed", 0))
+
+    if rotation_enable:
+        from verl.utils.qat.block_rotation import BlockRotationConfig, apply_block_rotation
+
+        rotation_config = BlockRotationConfig(
+            enable=True, block_size=rotation_block_size, seed=rotation_seed
+        )
+    else:
+        rotation_config = None
+
     async for name, tensor in ensure_async_iterator(weights):
         if any(p.search(name) for p in _IGNORE_PATTERNS):
             yield name, tensor
         else:
+            if rotation_config is not None:
+                tensor = apply_block_rotation(tensor, rotation_config)
             yield name, _hif8_fake_quant_inline(tensor, "per_tensor", 32).contiguous()
 
 
@@ -326,7 +347,8 @@ class ServerAdapter(BaseRollout):
         # This avoids the fp32 memory spike from _hif8_fake_quant on NPU,
         # which OOMs for large MoE models.  vLLM receives already-quantized
         # bf16 weights and stores them directly — no second copy needed.
-        weights = _pre_quantize_weights(weights)
+        qat_config = getattr(self.config, "qat", None) or {}
+        weights = _pre_quantize_weights(weights, qat_config=qat_config)
         await sender.async_send_weights(weights)
 
         if future is not None:
