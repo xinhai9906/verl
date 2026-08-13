@@ -504,6 +504,9 @@ class FSDPEngine(BaseEngine):
                 "granularity": getattr(self._qat_config, "granularity", "per_tensor"),
                 "probe_quant_error": getattr(self._qat_config, "probe_quant_error", False),
                 "probe_output_path": getattr(self._qat_config, "probe_output_path", None),
+                "rotation_enable": getattr(self._qat_config, "rotation_enable", False),
+                "rotation_block_size": getattr(self._qat_config, "rotation_block_size", 32),
+                "rotation_seed": getattr(self._qat_config, "rotation_seed", 0),
             },
         )
         if self._qat_config.mode not in ("w8_hif8", "w8a8_hif8"):

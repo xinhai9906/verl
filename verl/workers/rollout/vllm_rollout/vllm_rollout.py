@@ -161,6 +161,8 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
     rotation_enable = bool(qat_config.get("rotation_enable", False))
     rotation_block_size = int(qat_config.get("rotation_block_size", 32))
     rotation_seed = int(qat_config.get("rotation_seed", 0))
+    granularity = qat_config.get("granularity", "per_tensor")
+    group_size = int(qat_config.get("group_size", 32))
 
     if rotation_enable:
         from verl.utils.qat.block_rotation import BlockRotationConfig, apply_block_rotation
@@ -177,7 +179,7 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
         else:
             if rotation_config is not None:
                 tensor = apply_block_rotation(tensor, rotation_config)
-            yield name, _hif8_fake_quant_inline(tensor, "per_tensor", 32).contiguous()
+            yield name, _hif8_fake_quant_inline(tensor, granularity, group_size).contiguous()
 
 
 

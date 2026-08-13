@@ -136,6 +136,11 @@ class QATEngineConfig(BaseConfig):
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
+        probe_quant_error (bool): Enable per-layer quant-error probe, default False
+        probe_output_path (Optional[str]): JSONL output path for probe reports
+        rotation_enable (bool): Apply block Hadamard rotation before quantisation
+        rotation_block_size (int): Rotation block size (must equal group_size for per_group)
+        rotation_seed (int): Random sign seed for the rotation matrix
     """
 
     enable: bool = False
@@ -147,6 +152,9 @@ class QATEngineConfig(BaseConfig):
     quantization_config_path: Optional[str] = None
     probe_quant_error: bool = False
     probe_output_path: Optional[str] = None
+    rotation_enable: bool = False
+    rotation_block_size: int = 32
+    rotation_seed: int = 0
 
 
 @dataclass
