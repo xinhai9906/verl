@@ -89,14 +89,15 @@ def apply_hif8_qat_to_moe(
     """
     patched_count = 0
     probe_layer_names = probe_layer_names or {}
-    rotation_config = BlockRotationConfig(
-        enable=rotation_enable, block_size=rotation_block_size, seed=rotation_seed
-    )
-    if granularity == "per_group" and rotation_enable and rotation_block_size != group_size:
-        raise ValueError(
-            f"per_group rotation requires block_size == group_size={group_size}, "
-            f"got rotation_block_size={rotation_block_size}"
+    if rotation_enable:
+        logger.warning(
+            "[HiF8 MoE QAT] Block rotation is NOT supported for MoE blocks and "
+            "will be disabled: down_proj weights rotate along the intermediate "
+            "dimension whose activations are produced inside the fused GMM "
+            "kernel (never rotated), and rotating the MoE input would change "
+            "router inputs. Dense layers keep rotation; MoE runs unrotated."
         )
+    rotation_config = BlockRotationConfig()  # rotation disabled for MoE
     base_cfg = {
         "granularity": granularity,
         "group_size": group_size,

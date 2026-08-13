@@ -154,6 +154,12 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
         re.compile(r".*\.(embed_tokens|lm_head)\.weight$"),
         re.compile(r".*\.mlp\.gate\."),
     ]
+    # MoE expert weights must NOT be rotated: down_proj rotates along the
+    # intermediate dimension whose activations are produced inside the fused
+    # GMM kernel (never rotated), so the Q@Q^T cancellation never happens.
+    # Matches both per-expert expanded keys (…mlp.experts.0.gate_proj.weight)
+    # and stacked 3D params (…mlp.experts.gate_up_proj / down_proj).
+    _MOE_EXPERT_PATTERN = re.compile(r".*\.mlp\.experts\.")
 
     from verl.workers.rollout.utils import ensure_async_iterator
 
@@ -177,7 +183,7 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
         if any(p.search(name) for p in _IGNORE_PATTERNS):
             yield name, tensor
         else:
-            if rotation_config is not None:
+            if rotation_config is not None and not _MOE_EXPERT_PATTERN.search(name):
                 tensor = apply_block_rotation(tensor, rotation_config)
             yield name, _hif8_fake_quant_inline(tensor, granularity, group_size).contiguous()
 
