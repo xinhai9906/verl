@@ -140,52 +140,94 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
     (param_offload=True), so the float32 upcast uses system RAM instead
     of NPU HBM — avoiding OOM for large MoE models.
 
-    Only quantizes weights that the vLLM HiF8 scheme wraps (linear + MoE
-    expert weights).  Embedding, lm_head, and MoE gate layers are skipped.
+    Only weights wrapped by the vLLM HiF8 scheme are quantized (attention
+    q/k/v/o, MoE expert weights, and dense MLP projections).  Everything
+    else — embeddings, lm_head, MoE router gate, RMSNorm — passes through
+    unchanged, matching the training-side QAT coverage.
 
-    When ``qat_config`` contains ``rotation_enable=True``, block Hadamard-sign
-    rotation is applied before fake-quant so that vLLM receives pre-rotated
-    weights — matching the QAT training forward where ``apply_block_rotation``
-    runs before ``HIF8FakeQuantFunction``.
+    Block rotation: vLLM's HiF8 linear scheme rotates activations by Q and
+    expects weights to arrive pre-rotated+quantised from verl.  Dense
+    linear weights are therefore rotated by the same Q (block Hadamard ×
+    random signs, applied on the in_features dim) BEFORE fake quantisation,
+    exactly matching the QAT forward: ``y = fq(xQ) @ fq(WQ)^T = x @ W^T``.
+    MoE expert weights are NOT rotated — the fused MoE path is unrotated
+    on both sides (down_proj rotates along the intermediate dim produced
+    inside the fused kernel, where the Q@Q^T cancellation cannot hold).
+
+    The quantise-or-not decision mirrors ``vllm_async_server._apply_quantization``
+    exactly: the vLLM engine runs the HiF8 scheme only when QAT is enabled,
+    probe mode is off, and the quant config JSON says ``ascend-hif8``.
+    Granularity / group_size / rotation settings are read from the SAME JSON
+    the engine consumes, so the two sides can never disagree.  In every
+    other case the engine runs raw bf16 and weights pass through unchanged.
     """
+    import json
     import re
 
-    _IGNORE_PATTERNS = [
-        re.compile(r".*\.(embed_tokens|lm_head)\.weight$"),
-        re.compile(r".*\.mlp\.gate\."),
+    from verl.utils.qat.block_rotation import BlockRotationConfig, apply_block_rotation
+
+    # Positive set: exactly the layers vLLM's ascend-hif8 scheme wraps.
+    _QUANTIZE_PATTERNS = [
+        re.compile(r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)\.weight$"),
+        re.compile(r".*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$"),
+        re.compile(r".*\.mlp\.(gate_proj|up_proj|down_proj)\.weight$"),
     ]
-    # MoE expert weights must NOT be rotated: down_proj rotates along the
-    # intermediate dimension whose activations are produced inside the fused
-    # GMM kernel (never rotated), so the Q@Q^T cancellation never happens.
-    # Matches both per-expert expanded keys (…mlp.experts.0.gate_proj.weight)
-    # and stacked 3D params (…mlp.experts.gate_up_proj / down_proj).
-    _MOE_EXPERT_PATTERN = re.compile(r".*\.mlp\.experts\.")
+    # vLLM's MoE scheme does not rotate — keep expert weights in the original basis.
+    _NO_ROTATE_PATTERNS = [
+        re.compile(r".*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$"),
+    ]
 
     from verl.workers.rollout.utils import ensure_async_iterator
 
     qat_config = qat_config or {}
-    rotation_enable = bool(qat_config.get("rotation_enable", False))
-    rotation_block_size = int(qat_config.get("rotation_block_size", 32))
-    rotation_seed = int(qat_config.get("rotation_seed", 0))
-    granularity = qat_config.get("granularity", "per_tensor")
-    group_size = int(qat_config.get("group_size", 32))
 
-    if rotation_enable:
-        from verl.utils.qat.block_rotation import BlockRotationConfig, apply_block_rotation
+    # Mirror vllm_async_server._apply_quantization: the engine is HiF8 only
+    # when QAT is enabled and probe mode is off; otherwise it runs raw bf16.
+    qat_enabled = bool(qat_config.get("enable", False))
+    probe_quant_error = bool(qat_config.get("probe_quant_error", False))
 
-        rotation_config = BlockRotationConfig(
-            enable=True, block_size=rotation_block_size, seed=rotation_seed
-        )
-    else:
-        rotation_config = None
+    # Quant settings come from the same JSON the engine reads (single source
+    # of truth), falling back to the qat dict if the JSON is unavailable.
+    quant_desc: dict = {}
+    quant_json_path = qat_config.get("quantization_config_path")
+    if quant_json_path:
+        try:
+            with open(quant_json_path) as _f:
+                quant_desc = json.load(_f)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[HiF8 sync] Failed to read quantization config %s: %s — "
+                "falling back to the qat config dict.",
+                quant_json_path, exc,
+            )
+
+    engine_hif8 = (
+        qat_enabled
+        and not probe_quant_error
+        and quant_desc.get("quant_method", qat_config.get("quant_method", "ascend-hif8")) == "ascend-hif8"
+    )
+
+    if not engine_hif8:
+        # Engine runs raw bf16 — send raw weights.
+        async for name, tensor in ensure_async_iterator(weights):
+            yield name, tensor
+        return
+
+    granularity = quant_desc.get("granularity", qat_config.get("granularity", "per_tensor"))
+    group_size = int(quant_desc.get("group_size", qat_config.get("group_size", 32)))
+    rotation_config = BlockRotationConfig(
+        enable=bool(quant_desc.get("rotation_enable", qat_config.get("rotation_enable", False))),
+        block_size=int(quant_desc.get("rotation_block_size", qat_config.get("rotation_block_size", 32))),
+        seed=int(quant_desc.get("rotation_seed", qat_config.get("rotation_seed", 0))),
+    )
 
     async for name, tensor in ensure_async_iterator(weights):
-        if any(p.search(name) for p in _IGNORE_PATTERNS):
+        if not any(p.search(name) for p in _QUANTIZE_PATTERNS):
             yield name, tensor
-        else:
-            if rotation_config is not None and not _MOE_EXPERT_PATTERN.search(name):
-                tensor = apply_block_rotation(tensor, rotation_config)
-            yield name, _hif8_fake_quant_inline(tensor, granularity, group_size).contiguous()
+            continue
+        if rotation_config.enable and not any(p.search(name) for p in _NO_ROTATE_PATTERNS):
+            tensor = apply_block_rotation(tensor.contiguous(), rotation_config)
+        yield name, _hif8_fake_quant_inline(tensor, granularity, group_size).contiguous()
 
 
 

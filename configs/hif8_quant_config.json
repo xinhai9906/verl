@@ -1,11 +1,11 @@
 {
   "quant_method": "ascend-hif8",
-  "granularity": "per_tensor",
+  "granularity": "per_group",
   "group_size": 32,
   "ignore": ["lm_head", "embed_tokens"],
   "probe_quant_error": false,
-  "probe_output_path": null,
-  "rotation_enable": false,
+  "probe_output_path": "/home/y00893431/output/probe_quant_error",
+  "rotation_enable": true,
   "rotation_block_size": 32,
   "rotation_seed": 0
 }
