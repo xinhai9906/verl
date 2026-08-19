@@ -62,6 +62,7 @@ def apply_hif8_qat_to_moe(
     rotation_block_size: int = 32,
     rotation_seed: int = 0,
     probe_layer_names: Optional[dict[int, str]] = None,
+    ignore_patterns: Optional[list[str]] = None,
 ) -> int:
     """Apply HiF8 QAT to all MoE blocks in the model.
 
@@ -83,12 +84,19 @@ def apply_hif8_qat_to_moe(
         rotation_seed: Random sign seed for the rotation matrix.
         probe_layer_names: Optional mapping ``{id(module): layer_name}`` for
             populating ``layer_type`` / ``layer_index`` in probe reports.
+        ignore_patterns: Module name patterns to exclude from MoE QAT
+            (mixed-precision fallback).  Plain patterns are substring-matched,
+            ``re:``-prefixed patterns are regex-matched (``re.match``) — same
+            semantics as ``QATConfig.ignore_patterns`` for dense linears.  A
+            matched MoE block runs completely unquantized, mirroring the
+            vLLM-side ``UnquantizedFusedMoEMethod`` fallback.
 
     Returns:
         int: Number of MoE blocks patched.
     """
     patched_count = 0
     probe_layer_names = probe_layer_names or {}
+    ignore_patterns = ignore_patterns or []
     if rotation_enable:
         logger.warning(
             "[HiF8 MoE QAT] Block rotation is NOT supported for MoE blocks and "
@@ -105,6 +113,15 @@ def apply_hif8_qat_to_moe(
         "probe_quant_error": probe_quant_error,
         "rotation_config": rotation_config,
     }
+
+    def _name_ignored(name: str) -> bool:
+        for pattern in ignore_patterns:
+            if pattern.startswith("re:"):
+                if re.match(pattern[3:], name):
+                    return True
+            elif pattern in name:
+                return True
+        return False
 
     # Collect all MoE block candidates
     candidates: list[tuple[str, torch.nn.Module, str]] = []
@@ -125,6 +142,14 @@ def apply_hif8_qat_to_moe(
         ):
             logger.debug(
                 "[HiF8 MoE QAT] Skipping %s (parent is already patched)", name)
+            continue
+
+        # Mixed-precision fallback: ignored blocks run completely unquantized,
+        # matching the vLLM-side UnquantizedFusedMoEMethod fallback.
+        if _name_ignored(name):
+            logger.info(
+                "[HiF8 MoE QAT] Ignoring MoE block %s (matches ignore_patterns) — "
+                "runs unquantized (BF16 fallback)", name)
             continue
 
         # Per-block config copy so each block gets its own layer_name
