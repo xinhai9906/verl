@@ -404,7 +404,8 @@ class QATLinear(nn.Linear):
 # Granularity modes:
 #   per_tensor:  one scale per tensor (weight: scalar, activation: scalar)
 #   per_channel: one scale per output channel (weight: (out,1), activation: per-token)
-#   per_group:   one scale per `group_size` elements along last dim
+#   per_group:   one scale per `group_size` elements along last dim (amax-based)
+#   per_group_median: like per_group, but scale = max(median of |x|, amax/HIF8_MAX)
 # ============================================================================
 
 
@@ -439,16 +440,38 @@ def hif8_fake_quant(
     granularity='per_tensor':  one scale per tensor  (amax over all elements)
     granularity='per_channel': one scale per row      (amax along last dim)
     granularity='per_group':   one scale per group    (amax per group_size along last dim)
+    granularity='per_group_median': one scale per group, anchored to the median
+        of |x| (average of the two middle sorted values for even group_size,
+        single middle for odd) mapped to 1.0, with amax/HIF8_MAX as the lower
+        bound so truncation never occurs.
     """
-    if granularity == "per_group":
+    if granularity in ("per_group", "per_group_median"):
         t = tensor.float()
         dim_size = t.shape[-1]
         pad = (group_size - dim_size % group_size) % group_size
         if pad:
-            t = F.pad(t, (0, pad))
+            t = F.pad(t, (0, pad))            # zeros, for amax + quant
         t_blocks = t.unflatten(-1, (-1, group_size))
         amax = t_blocks.abs().amax(dim=-1, keepdim=True)
-        scale = (amax / HIF8_MAX).clamp(min=1e-12)
+        if granularity == "per_group_median":
+            # Median of |x| per group: average of the two middle sorted values
+            # (indices gs//2-1, gs//2 for even gs; single middle for odd gs).
+            # Pad positions are imputed +inf so they sort to the tail and
+            # cannot distort the valid median; a tail block with gs//2 or
+            # fewer valid elements has +inf inside the slice, which
+            # posinf=0.0 maps to the amax-based lower bound. amax stays on
+            # the zero-padded t_blocks so a padded tail never reads +inf.
+            abs_med = tensor.float().abs()
+            if pad:
+                abs_med = F.pad(abs_med, (0, pad), value=float("inf"))
+            sorted_vals = abs_med.unflatten(-1, (-1, group_size)).sort(dim=-1).values
+            lo = (group_size - 1) // 2
+            hi = group_size // 2 + 1
+            median_avg = sorted_vals[..., lo:hi].mean(dim=-1, keepdim=True)
+            median_avg = torch.nan_to_num(median_avg, nan=0.0, posinf=0.0)
+            scale = torch.maximum(median_avg, amax / HIF8_MAX).clamp(min=1e-12)
+        else:
+            scale = (amax / HIF8_MAX).clamp(min=1e-12)
         q_blocks = _quant_hif8(t_blocks / scale) * scale
         result = q_blocks.flatten(-2, -1)
         if pad:
@@ -464,7 +487,9 @@ def hif8_fake_quant(
 
 class HIF8FakeQuantFunction(torch.autograd.Function):
     """HiF8 QAT: configurable granularity → tapered precision roundtrip.
-    Forward:  scale = amax/49152 → _quant_hif8 → ×scale
+    Forward:  scale → _quant_hif8(tensor / scale) → ×scale, where
+        per_group_median uses max(median of |x|, amax/49152) and all other
+        granularities use amax/49152.
     Backward: STE (Straight-Through Estimator) — gradient passes through unchanged.
         This is the standard QAT convention: forward sees quantized values so
         the loss captures quant-error; backward uses raw gradients so weight
@@ -516,6 +541,8 @@ class HIF8QATLinear(nn.Linear):
         ``"per_tensor"``   one scale per tensor
         ``"per_channel"``  one scale per output channel (weight) / token (act)
         ``"per_group"``    one scale per group of ``group_size`` elements
+        ``"per_group_median"``  per group, scale = max(median of |x|,
+            amax/HIF8_MAX) — median anchored to 1.0, amax bound prevents truncation
     quantize_activation:
         ``False`` – W8 (weight-only)
         ``True``  – W8A8 (full)
@@ -560,9 +587,9 @@ class HIF8QATLinear(nn.Linear):
         self.group_size = group_size
         self.hif8_probe_quant_error = hif8_probe_quant_error
         self.fake_quant_enabled = True
-        if granularity == "per_group" and rotation_enable and rotation_block_size != group_size:
+        if granularity in ("per_group", "per_group_median") and rotation_enable and rotation_block_size != group_size:
             raise ValueError(
-                f"per_group rotation requires block_size == group_size={group_size}, "
+                f"{granularity} rotation requires block_size == group_size={group_size}, "
                 f"got rotation_block_size={rotation_block_size}"
             )
         self.rotation_config = BlockRotationConfig(

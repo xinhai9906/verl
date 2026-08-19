@@ -33,15 +33,15 @@ class QATConfig(BaseConfig):
 
     enable: bool = False
     mode: str = "w4a16"  # "w4a16", "w4a4", "w8_hif8", or "w8a8_hif8"
-    granularity: str = "per_tensor"  # HiF8 granularity: "per_tensor", "per_channel", or "per_group"
-    group_size: int = 16  # block size for NVFP4; also used by HiF8 per_group mode
+    granularity: str = "per_tensor"  # HiF8 granularity: "per_tensor", "per_channel", "per_group", or "per_group_median"
+    group_size: int = 16  # block size for NVFP4; also used by HiF8 per_group/per_group_median mode
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
     probe_quant_error: bool = False  # Enable per-layer HiF8 quant-error probe (pure measurement, no noise)
     probe_output_path: Optional[str] = None  # JSONL output path for probe reports (None = log only)
     rotation_enable: bool = False  # Apply block Hadamard rotation before quantisation
-    rotation_block_size: int = 32  # Rotation block size (must equal group_size for per_group)
+    rotation_block_size: int = 32  # Rotation block size (must equal group_size for per_group/per_group_median)
     rotation_seed: int = 0  # Random sign seed for the rotation matrix
 
 
@@ -169,7 +169,8 @@ def apply_qat(
             probe_quant_error=probe_enabled,
             rotation_enable=config.rotation_enable,
             rotation_block_size=config.rotation_block_size,
-            rotation_seed=config.rotation_seed)
+            rotation_seed=config.rotation_seed,
+            ignore_patterns=list(config.ignore_patterns))
 
         # Collect module ids under MoE blocks to skip redundant Linear
         # replacement (MoE forwards bypass Linear.forward anyway).

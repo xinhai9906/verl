@@ -108,18 +108,39 @@ def _hif8_fake_quant_inline(
 ) -> torch.Tensor:
     """HiF8 fake quant, identical to _hif8_fake_quant in vllm-ascend.
 
-    Inlined here to avoid ``import vllm_ascend`` in the WorkerDict
-    (training) process, which can trigger NPU-related side effects.
+    Supports per_tensor / per_channel / per_group / per_group_median
+    granularity (per_group_median anchors the median of |x| to 1.0 with
+    amax/HIF8_MAX as the lower bound). Inlined here to avoid
+    ``import vllm_ascend`` in the WorkerDict (training) process, which can
+    trigger NPU-related side effects.
     """
-    if granularity == "per_group":
+    if granularity in ("per_group", "per_group_median"):
         t = tensor.float()
         dim_size = t.shape[-1]
         pad = (group_size - dim_size % group_size) % group_size
         if pad:
-            t = torch.nn.functional.pad(t, (0, pad))
+            t = torch.nn.functional.pad(t, (0, pad))            # zeros, for amax + quant
         t_blocks = t.unflatten(-1, (-1, group_size))
         amax = t_blocks.abs().amax(dim=-1, keepdim=True)
-        scale = (amax / _HIF8_MAX).clamp(min=1e-12)
+        if granularity == "per_group_median":
+            # Median of |x| per group: average of the two middle sorted values
+            # (indices gs//2-1, gs//2 for even gs; single middle for odd gs).
+            # Pad positions are imputed +inf so they sort to the tail and
+            # cannot distort the valid median; a tail block with gs//2 or
+            # fewer valid elements has +inf inside the slice, which
+            # posinf=0.0 maps to the amax-based lower bound. amax stays on
+            # the zero-padded t_blocks so a padded tail never reads +inf.
+            abs_med = tensor.float().abs()
+            if pad:
+                abs_med = torch.nn.functional.pad(abs_med, (0, pad), value=float("inf"))
+            sorted_vals = abs_med.unflatten(-1, (-1, group_size)).sort(dim=-1).values
+            lo = (group_size - 1) // 2
+            hi = group_size // 2 + 1
+            median_avg = sorted_vals[..., lo:hi].mean(dim=-1, keepdim=True)
+            median_avg = torch.nan_to_num(median_avg, nan=0.0, posinf=0.0)
+            scale = torch.maximum(median_avg, amax / _HIF8_MAX).clamp(min=1e-12)
+        else:
+            scale = (amax / _HIF8_MAX).clamp(min=1e-12)
         q_blocks = _quant_hif8_inline(t_blocks / scale) * scale
         result = q_blocks.flatten(-2, -1)
         if pad:
@@ -221,8 +242,24 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
         seed=int(quant_desc.get("rotation_seed", qat_config.get("rotation_seed", 0))),
     )
 
+    # Mixed-precision fallback: layers matching ignore_patterns run
+    # unquantized on both the engine side (UnquantizedLinearMethod /
+    # UnquantizedFusedMoEMethod) and the training side — send their weights
+    # raw so the two sides stay aligned.  Same semantics as the training-side
+    # QAT: plain patterns are substring-matched, "re:" patterns regex-matched.
+    ignore_patterns = qat_config.get("ignore_patterns") or []
+
+    def _ignored(name: str) -> bool:
+        for pattern in ignore_patterns:
+            if pattern.startswith("re:"):
+                if re.match(pattern[3:], name):
+                    return True
+            elif pattern in name:
+                return True
+        return False
+
     async for name, tensor in ensure_async_iterator(weights):
-        if not any(p.search(name) for p in _QUANTIZE_PATTERNS):
+        if _ignored(name) or not any(p.search(name) for p in _QUANTIZE_PATTERNS):
             yield name, tensor
             continue
         if rotation_config.enable and not any(p.search(name) for p in _NO_ROTATE_PATTERNS):
