@@ -201,38 +201,48 @@ def get_npu_versions() -> tuple[str, str]:
     Raises:
         RuntimeError: If unable to retrieve version information
     """
-    # Check npu-smi software version
-    try:
-        result = subprocess.run(
-            ["npu-smi", "info", "-t", "board", "-i", "1"], capture_output=True, text=True, check=True
-        )
-    except subprocess.CalledProcessError:
-        # Card 1 not found (common in K8s with non-consecutive device IDs)
-        # Try first device from ASCEND_VISIBLE_DEVICES env var
-        visible_devices = os.environ.get("ASCEND_VISIBLE_DEVICES")
-        if not visible_devices:
-            raise  # Re-raise original error if env var not set
+    # Probe candidate device ids in turn: prefer the devices this process can
+    # actually see (ASCEND_RT_VISIBLE_DEVICES / ASCEND_VISIBLE_DEVICES),
+    # falling back to physical 0-3.  Querying a broken or unassigned card
+    # (e.g. a faulty card 1) makes npu-smi exit non-zero, so we must not
+    # hardcode "-i 1" — try each candidate until one succeeds.
+    candidates: list[int] = []
+    for env_name in ("ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES"):
+        visible = os.environ.get(env_name)
+        if visible:
+            for token in visible.replace(" ", "").split(","):
+                if token:
+                    try:
+                        candidates.append(int(token))
+                    except ValueError:
+                        pass
+            break
+    if not candidates:
+        candidates = [0, 1, 2, 3]
 
-        try:
-            npu_id = int(visible_devices.split(",")[0])
-        except (ValueError, IndexError):
-            raise  # Re-raise original error if env var format invalid
-
-        # Retry with the first available device from K8s
-        try:
-            result = subprocess.run(
-                ["npu-smi", "info", "-t", "board", "-i", str(npu_id)], capture_output=True, text=True, check=True
-            )
-        except subprocess.CalledProcessError:
-            # On A3 machines with one-card-two-die, the device ID is a die index.
-            # Try using the physical card index (npu_id // 2) instead.
-            physical_card_id = npu_id // 2
-            result = subprocess.run(
-                ["npu-smi", "info", "-t", "board", "-i", str(physical_card_id)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+    result = None
+    last_exc = None
+    for npu_id in candidates:
+        # Also try the physical card index (npu_id // 2) for A3 machines with
+        # one-card-two-die, where the device id is a die index.
+        probe_ids = [npu_id] if npu_id // 2 == npu_id else [npu_id, npu_id // 2]
+        for probe_id in probe_ids:
+            try:
+                result = subprocess.run(
+                    ["npu-smi", "info", "-t", "board", "-i", str(probe_id)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                break
+            except subprocess.CalledProcessError as exc:
+                last_exc = exc
+        if result is not None:
+            break
+    if result is None:
+        raise RuntimeError(
+            f"Failed to query npu-smi board info on any candidate device {candidates}: {last_exc}"
+        ) from last_exc
 
     # Parse software version from output
     software_version = None
