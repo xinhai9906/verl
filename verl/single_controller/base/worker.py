@@ -31,6 +31,29 @@ from verl.utils.device import (
 from .decorator import Dispatch, Execute, register
 
 
+def _physical_to_logical_device_id(physical_id: str, device_name: str) -> str:
+    """Map a ray-assigned physical device id to its logical index.
+
+    With RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES=1, worker processes inherit
+    the parent's visible-device list and torch renumbers the visible devices
+    to logical [0, n). Ray, however, hands out *physical* ids from that list,
+    so passing the raw id to ``set_device()`` fails for any non-identity list
+    (e.g. ASCEND_RT_VISIBLE_DEVICES="4,5,6,7" to skip a faulty card fails
+    with "value 4 ... Expected value: [0, 4)"). Convert via the list index;
+    fall back to the raw id when the list is unset or the id is absent
+    (identity mapping).
+    """
+    env_key = "ASCEND_RT_VISIBLE_DEVICES" if device_name == "NPU" else "CUDA_VISIBLE_DEVICES"
+    visible = os.environ.get(env_key, "")
+    if not visible:
+        return physical_id
+    visible_ids = [x.strip() for x in visible.split(",") if x.strip() != ""]
+    try:
+        return str(visible_ids.index(str(physical_id)))
+    except ValueError:
+        return physical_id
+
+
 @dataclass
 class DistRankInfo:
     tp_rank: int
@@ -276,7 +299,12 @@ class Worker(WorkerHelper):
             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set,
             # so we need to set local rank when the flag is set.
             device_name = "NPU" if is_npu_available else "GPU"
-            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            # Ray assigns *physical* accelerator ids, but this process sees
+            # the parent's visible-device list as logical [0, n) — map the
+            # physical id back to its logical index so set_device() works
+            # with non-identity lists (e.g. "4,5,6,7" to skip a faulty card).
+            physical_id = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            local_rank = _physical_to_logical_device_id(physical_id, device_name)
             os.environ["LOCAL_RANK"] = local_rank
             get_torch_device().set_device(int(local_rank))
 
