@@ -702,12 +702,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         set_expandable_segments(False)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
-        # 1. resume rollout memory (weights were released during sleep)
+        # 0. Enforce the documented invariant "rollout is in sleep mode before
+        # update_weights": the async agent loop may have woken the engine for
+        # the first rollout (stale HF weights) while the trainer was still
+        # loading checkpoints.  Syncing into an awake engine with the KV pool
+        # allocated OOMs on 64GB cards (aclrtMallocPhysical 207001).  Sleeping
+        # first releases the KV pool; any in-flight pre-sync rollout is
+        # aborted, and the training loop re-enqueues a fresh batch with the
+        # synced weights afterwards.
         if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["weights"])
-        log_gpu_memory_usage("After resume weights", logger=logger)
+            await self.rollout.release()
 
-        # 2. determine if we need a base weight sync (adapter path only)
+        # 0.5 determine if we need a base weight sync (adapter path only)
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=True
         )
@@ -717,7 +723,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.rollout.sleep_level = 1
             do_lora_base_sync = not self.base_sync_done
 
-        # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
+        # 0.6 Offload the actor model to CPU BEFORE waking the engine for the
+        # weight sync: at the end of a training step the actor still holds
+        # ~35-40GB on each NPU, and waking the engine + allocating the new
+        # weight tensors on top of that OOMs (aclrtMallocPhysical 207001).
+        # The sync payload was already gathered above, so offloading first is
+        # safe and only reorders memory, not computation.
+        if self.actor.engine.is_param_offload_enabled:
+            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+        aggressive_empty_cache(force_sync=True)
+
+        # 1. resume rollout memory (weights were released during sleep)
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["weights"])
+        log_gpu_memory_usage("After resume weights", logger=logger)
+
+        # 2. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
             per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
                 layered_summon=self.layered_summon, base_sync_done=False
@@ -732,12 +753,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
-        # 3. offload model to cpu
-        if self.actor.engine.is_param_offload_enabled:
-            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
-
-        # 4. resume kv_cache
+        # 3. resume kv_cache
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
         log_gpu_memory_usage("After resume kv_cache", logger=logger)

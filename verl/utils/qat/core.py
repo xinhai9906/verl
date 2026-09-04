@@ -33,7 +33,7 @@ class QATConfig(BaseConfig):
 
     enable: bool = False
     mode: str = "w4a16"  # "w4a16", "w4a4", "w8_hif8", or "w8a8_hif8"
-    granularity: str = "per_tensor"  # HiF8 granularity: "per_tensor", "per_channel", "per_group", or "per_group_median"
+    granularity: str = "per_tensor"  # HiF8 granularity: "per_tensor", "per_channel", "per_group", "per_group_median", or "per_channel_median"
     group_size: int = 16  # block size for NVFP4; also used by HiF8 per_group/per_group_median mode
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"

@@ -1,11 +1,11 @@
 {
   "quant_method": "ascend-hif8",
-  "granularity": "per_group_median",
+  "granularity": "per_channel_median",
   "group_size": 32,
   "ignore": ["lm_head", "embed_tokens", "re:.*mlp.gate$"],
   "probe_quant_error": false,
   "probe_output_path": "/home/y00893431/output/probe_quant_error",
-  "rotation_enable": true,
+  "rotation_enable": false,
   "rotation_block_size": 32,
   "rotation_seed": 0
 }

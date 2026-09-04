@@ -196,6 +196,15 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     up_res = NPUGmmFunction.apply(permuted_tokens, w1, tokens_per_expert)
     gate_res = NPUGmmFunction.apply(permuted_tokens, w2, tokens_per_expert)
     act_res = torch_npu.npu_swiglu(torch.cat([gate_res, up_res], dim=-1))
+    # HiF8 QAT block rotation: rotate the intermediate activation (intermediate
+    # dim) so it cancels with the rotated down_proj weights (Q·Qᵀ = I).  The
+    # config is set on the MoE block by verl.utils.qat.moe; without it, or when
+    # rotation is disabled, this is a no-op.
+    moe_rotation_config = getattr(self, "_hif8_moe_rotation_config", None)
+    if moe_rotation_config is not None and moe_rotation_config.enable:
+        from verl.utils.qat.block_rotation import apply_block_rotation
+
+        act_res = apply_block_rotation(act_res, moe_rotation_config)
     down_res = NPUGmmFunction.apply(act_res, w3, tokens_per_expert)
 
     routed_hidden_states = torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=routing_weights)

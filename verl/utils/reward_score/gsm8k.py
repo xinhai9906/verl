@@ -15,6 +15,24 @@
 import re
 
 _SOLUTION_CLIP_CHARS = 300
+_ANSWER_PATTERN = r"\-?[0-9\.\,]+"
+_OPTIONAL_DOLLAR_PATTERN = r"(?:\\?\$)?"
+_STRICT_ANSWER_PATTERNS = [
+    re.compile(
+        r"####\s*" + _OPTIONAL_DOLLAR_PATTERN + f"(?P<answer>{_ANSWER_PATTERN})" + _OPTIONAL_DOLLAR_PATTERN
+    ),
+    re.compile(
+        r"\\boxed\s*\{\s*"
+        + _OPTIONAL_DOLLAR_PATTERN
+        + f"(?P<answer>{_ANSWER_PATTERN})"
+        + _OPTIONAL_DOLLAR_PATTERN
+        + r"\s*\}"
+    ),
+]
+
+
+def _normalize_answer(answer):
+    return answer.replace(",", "").replace("$", "")
 
 
 def extract_solution(solution_str, method="strict"):
@@ -28,12 +46,16 @@ def extract_solution(solution_str, method="strict"):
 
     if method == "strict":
         # this also tests the formatting of the model
-        solutions = re.findall("#### (\\-?[0-9\\.\\,]+)", solution_str)
+        solutions = [
+            (match.start(), match.group("answer"))
+            for pattern in _STRICT_ANSWER_PATTERNS
+            for match in pattern.finditer(solution_str)
+        ]
         if len(solutions) == 0:
             final_answer = None
         else:
             # take the last solution
-            final_answer = solutions[-1].replace(",", "").replace("$", "")
+            final_answer = _normalize_answer(max(solutions, key=lambda solution: solution[0])[1])
     elif method == "flexible":
         answer = re.findall("(\\-?[0-9\\.\\,]+)", solution_str)
         final_answer = None

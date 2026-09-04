@@ -97,15 +97,17 @@ def apply_hif8_qat_to_moe(
     patched_count = 0
     probe_layer_names = probe_layer_names or {}
     ignore_patterns = ignore_patterns or []
-    if rotation_enable:
-        logger.warning(
-            "[HiF8 MoE QAT] Block rotation is NOT supported for MoE blocks and "
-            "will be disabled: down_proj weights rotate along the intermediate "
-            "dimension whose activations are produced inside the fused GMM "
-            "kernel (never rotated), and rotating the MoE input would change "
-            "router inputs. Dense layers keep rotation; MoE runs unrotated."
-        )
-    rotation_config = BlockRotationConfig()  # rotation disabled for MoE
+    # Block rotation for MoE: rotate the block input (hidden dim) together with
+    # the router gate weight and the gate/up expert weights, and rotate the
+    # intermediate activation (intermediate dim) together with the down_proj
+    # weights.  The intermediate rotation is applied inside the NPU MoE forward
+    # (see npu_patch._qwen3_sparse_moe_routed_forward_npu), gated by the
+    # ``_hif8_moe_rotation_config`` attribute set per block below.
+    rotation_config = BlockRotationConfig(
+        enable=rotation_enable,
+        block_size=rotation_block_size,
+        seed=rotation_seed,
+    )
     base_cfg = {
         "granularity": granularity,
         "group_size": group_size,
@@ -152,12 +154,59 @@ def apply_hif8_qat_to_moe(
                 "runs unquantized (BF16 fallback)", name)
             continue
 
+        # Block rotation is supported for per-expert nn.Linear MoE blocks and
+        # for stacked-parameter blocks whose K (in_features) dim is the LAST
+        # dim of gate_up_proj/down_proj (Transformers 5 Qwen3 MoE layout:
+        # gate_up_proj [E, 2*inter, hidden], down_proj [E, hidden, inter]).
+        # Qwen3Next-style shared experts, experts modules without a router
+        # gate, and stacked layouts with a non-last K dim stay unrotated.
+        block_rotation_cfg = rotation_config
+        if rotation_config.enable:
+            skip_reason = None
+            if hasattr(module, "shared_expert"):
+                skip_reason = "shared_expert present"
+            elif moe_type == "stacked_params_self":
+                skip_reason = "experts-level module without router gate"
+            else:
+                gate_mod = _gate_weight_module(getattr(module, "gate", None))
+                if gate_mod is None:
+                    skip_reason = "router gate weight not found"
+                elif moe_type == "stacked_params_experts":
+                    experts = getattr(module, "experts", None)
+                    gate_up = getattr(experts, "gate_up_proj", None)
+                    down = getattr(experts, "down_proj", None)
+                    hidden = gate_mod.weight.shape[-1]
+                    if (
+                        not isinstance(gate_up, nn.Parameter)
+                        or gate_up.ndim != 3
+                        or gate_up.shape[-1] != hidden
+                        or not isinstance(down, nn.Parameter)
+                        or down.ndim != 3
+                        or down.shape[-1] == hidden
+                    ):
+                        skip_reason = "stacked-param layout not rotation-compatible"
+            if skip_reason is not None:
+                logger.warning(
+                    "[HiF8 MoE QAT] Block rotation disabled for %s (%s) — "
+                    "the block runs unrotated.", name, skip_reason)
+                block_rotation_cfg = BlockRotationConfig()
+
         # Per-block config copy so each block gets its own layer_name
         layer_name = probe_layer_names.get(id(module), name)
         qat_cfg = dict(base_cfg, layer_name=layer_name)
+        qat_cfg["rotation_config"] = block_rotation_cfg
         qat_cfg["layer_type"] = _infer_moe_layer_type(name)
         qat_cfg["layer_index"] = _infer_moe_layer_index(name)
 
+        # The NPU MoE forward reads this attribute to decide whether to rotate
+        # the intermediate activation before the down_proj GMM.  Probe mode
+        # runs the original unmodified forward, so the attribute must stay
+        # disabled there (weights/x are not rotated during probe forwards).
+        setattr(
+            module,
+            "_hif8_moe_rotation_config",
+            block_rotation_cfg if not probe_quant_error else BlockRotationConfig(),
+        )
         setattr(module, _QAT_CONFIG_ATTR, qat_cfg)
         _patch_moe_forward(module, moe_type, qat_cfg)
         patched_count += 1
@@ -258,6 +307,52 @@ def _detect_moe_path(module: torch.nn.Module) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Router gate rotation helpers
+# ---------------------------------------------------------------------------
+
+def _gate_weight_module(gate: Optional[nn.Module]) -> Optional[nn.Module]:
+    """Locate the module owning the router gate weight.
+
+    Handles legacy blocks where ``gate`` is an ``nn.Linear`` as well as newer
+    blocks whose gate is a plain module holding a ``weight`` Parameter or an
+    inner ``nn.Linear``.
+    """
+    if gate is None:
+        return None
+    if isinstance(gate, nn.Linear):
+        return gate
+    if isinstance(getattr(gate, "weight", None), nn.Parameter):
+        return gate
+    for sub in gate.modules():
+        if isinstance(sub, nn.Linear):
+            return sub
+    for sub in gate.modules():
+        if isinstance(getattr(sub, "weight", None), nn.Parameter):
+            return sub
+    return None
+
+
+def _swap_rotated_gate_weight(
+    gate: Optional[nn.Module], rotation_config: BlockRotationConfig
+) -> tuple[Optional[nn.Module], Optional[torch.nn.Parameter]]:
+    """Temporarily replace the router gate weight with a rotated copy.
+
+    Returns ``(weight_module, saved_parameter)``; the caller must restore the
+    saved parameter after the forward.  The rotated copy is unquantized — the
+    gate stays BF16 and only its basis changes, so routing logits are unchanged
+    when the block input is rotated by the same Q (Q·Qᵀ = I).
+    """
+    mod = _gate_weight_module(gate)
+    if mod is None:
+        return None, None
+    rotated = apply_block_rotation(mod.weight, rotation_config)
+    saved = mod.weight
+    mod._parameters.pop("weight", None)
+    mod.weight = rotated
+    return mod, saved
+
+
+# ---------------------------------------------------------------------------
 # Forward patching
 # ---------------------------------------------------------------------------
 
@@ -340,10 +435,31 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
             return orig_forward(hidden_states)
 
         # -- normal QAT: pseudo-quantize weights via STE ----------------------
+        # With rotation enabled, rotate the block input and the router gate
+        # weight (same Q, so routing logits are unchanged), then rotate each
+        # expert weight along its in_features dim before quantisation.  The
+        # intermediate activation is rotated inside the NPU MoE forward,
+        # gated by the block's ``_hif8_moe_rotation_config`` attribute.
+        effective_rotation = rotation_config
+        gate_mod: Optional[nn.Module] = None
+        saved_gate_weight: Optional[torch.nn.Parameter] = None
+        if rotation_config.enable:
+            gate_mod, saved_gate_weight = _swap_rotated_gate_weight(
+                getattr(self, "gate", None), rotation_config
+            )
+            if gate_mod is None:
+                logger.warning(
+                    "[HiF8 MoE QAT] Router gate weight not found at forward "
+                    "time — this forward runs unrotated."
+                )
+                effective_rotation = BlockRotationConfig()
+            else:
+                hidden_states = apply_block_rotation(
+                    hidden_states, effective_rotation
+                )
         if quantize_act:
-            rotated_h = apply_block_rotation(hidden_states, rotation_config)
             hidden_states = HIF8FakeQuantFunction.apply(
-                rotated_h, granularity, group_size
+                hidden_states, granularity, group_size
             ).contiguous()
 
         quantized_weights: dict[str, torch.Tensor] = {}
@@ -352,7 +468,7 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
                 proj = getattr(expert, pn, None)
                 if isinstance(proj, nn.Linear):
                     rotated_w = apply_block_rotation(
-                        proj.weight, rotation_config
+                        proj.weight, effective_rotation
                     )
                     quantized_weights[f"{ei}.{pn}"] = (
                         HIF8FakeQuantFunction.apply(
@@ -368,6 +484,12 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
             proj._parameters.pop("weight", None)
             proj.weight = qw
 
+        # Keep the block's intermediate-rotation attribute in sync with the
+        # effective rotation used for this forward: a fallback forward runs
+        # unrotated, so the NPU forward must not rotate the intermediate.
+        saved_rotation_attr = getattr(self, "_hif8_moe_rotation_config", None)
+        if effective_rotation != rotation_config:
+            self._hif8_moe_rotation_config = effective_rotation
         try:
             return orig_forward(hidden_states)
         finally:
@@ -379,6 +501,14 @@ def _make_qwen3_linear_qat_forward(orig_forward, qat_cfg: dict):
                 except AttributeError:
                     pass
                 proj.register_parameter("weight", orig_param)
+            if gate_mod is not None:
+                try:
+                    delattr(gate_mod, "weight")
+                except AttributeError:
+                    pass
+                gate_mod.register_parameter("weight", saved_gate_weight)
+            if saved_rotation_attr is not None and effective_rotation != rotation_config:
+                self._hif8_moe_rotation_config = saved_rotation_attr
 
     return qat_forward
 
@@ -438,23 +568,49 @@ def _make_stacked_param_qat_forward(
             return orig_forward(*args, **kwargs)
 
         # -- normal QAT: pseudo-quantize weights via STE -----------------------
+        # With rotation enabled (block-level stacked layout with last-dim K),
+        # rotate the block input and the router gate weight (same Q, so
+        # routing logits are unchanged), then rotate gate_up_proj/down_proj
+        # along their K dim before quantisation.  The intermediate activation
+        # is rotated inside the NPU MoE forward, gated by the block's
+        # ``_hif8_moe_rotation_config`` attribute.
+        effective_rotation = rotation_config
+        gate_mod: Optional[nn.Module] = None
+        saved_gate_weight: Optional[torch.nn.Parameter] = None
+        if rotation_config.enable and not is_self:
+            gate_mod, saved_gate_weight = _swap_rotated_gate_weight(
+                getattr(self, "gate", None), rotation_config
+            )
+            if gate_mod is None:
+                logger.warning(
+                    "[HiF8 MoE QAT] Router gate weight not found at forward "
+                    "time — this forward runs unrotated."
+                )
+                effective_rotation = BlockRotationConfig()
+            elif args:
+                args = (apply_block_rotation(args[0], effective_rotation),) + args[1:]
+
         saved: dict[str, torch.nn.Parameter] = {}
         for attr in ("gate_up_proj", "down_proj"):
             param = getattr(target, attr, None)
             if isinstance(param, torch.nn.Parameter):
                 saved[attr] = param
-                rotated = apply_block_rotation(param, rotation_config)
+                rotated = apply_block_rotation(param, effective_rotation)
                 target._parameters.pop(attr, None)
                 setattr(target, attr,
                         HIF8FakeQuantFunction.apply(
                             rotated, granularity, group_size
                         ).contiguous())
 
+        # Keep the block's intermediate-rotation attribute in sync with the
+        # effective rotation used for this forward.
+        saved_rotation_attr = getattr(self, "_hif8_moe_rotation_config", None)
+        if effective_rotation != rotation_config:
+            self._hif8_moe_rotation_config = effective_rotation
         try:
             if quantize_act and args:
-                rotated_h = apply_block_rotation(args[0], rotation_config)
                 args = (HIF8FakeQuantFunction.apply(
-                    rotated_h, granularity, group_size
+                    args[0], granularity, group_size
                 ).contiguous(),) + args[1:]
             return orig_forward(*args, **kwargs)
         finally:
@@ -464,5 +620,13 @@ def _make_stacked_param_qat_forward(
                 except AttributeError:
                     pass
                 target.register_parameter(attr, orig_param)
+            if gate_mod is not None:
+                try:
+                    delattr(gate_mod, "weight")
+                except AttributeError:
+                    pass
+                gate_mod.register_parameter("weight", saved_gate_weight)
+            if saved_rotation_attr is not None and effective_rotation != rotation_config:
+                self._hif8_moe_rotation_config = saved_rotation_attr
 
     return qat_forward

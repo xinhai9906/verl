@@ -406,6 +406,7 @@ class QATLinear(nn.Linear):
 #   per_channel: one scale per output channel (weight: (out,1), activation: per-token)
 #   per_group:   one scale per `group_size` elements along last dim (amax-based)
 #   per_group_median: like per_group, but scale = max(median of |x|, amax/HIF8_MAX)
+#   per_channel_median: like per_channel, but scale = max(median of |x|, amax/HIF8_MAX)
 # ============================================================================
 
 
@@ -444,6 +445,9 @@ def hif8_fake_quant(
         of |x| (average of the two middle sorted values for even group_size,
         single middle for odd) mapped to 1.0, with amax/HIF8_MAX as the lower
         bound so truncation never occurs.
+    granularity='per_channel_median': one scale per row, anchored to the median
+        of |x| over the whole row, with amax/HIF8_MAX as the lower bound so
+        truncation never occurs.
     """
     if granularity in ("per_group", "per_group_median"):
         t = tensor.float()
@@ -477,6 +481,23 @@ def hif8_fake_quant(
         if pad:
             result = result[..., :dim_size]
         return result.to(tensor.dtype)
+    elif granularity == "per_channel_median":
+        # Median of |x| per channel (row): average of the two middle sorted
+        # values (indices dim//2-1, dim//2 for even dim, single middle for
+        # odd), anchored to 1.0, with amax/HIF8_MAX as the lower bound so
+        # truncation never occurs.  No padding — the whole row is sorted, so
+        # there is no tail-group edge case (unlike per_group_median).
+        t = tensor.float()
+        abs_t = t.abs()
+        sorted_vals = abs_t.sort(dim=-1).values
+        dim_size = t.shape[-1]
+        lo = (dim_size - 1) // 2
+        hi = dim_size // 2 + 1
+        median_avg = sorted_vals[..., lo:hi].mean(dim=-1, keepdim=True)
+        median_avg = torch.nan_to_num(median_avg, nan=0.0)
+        amax = abs_t.amax(dim=-1, keepdim=True)
+        scale = torch.maximum(median_avg, amax / HIF8_MAX).clamp(min=1e-12)
+        return (_quant_hif8(t / scale) * scale).to(tensor.dtype)
     elif granularity == "per_channel":
         amax = tensor.float().abs().amax(dim=-1, keepdim=True)
     else:
@@ -488,8 +509,8 @@ def hif8_fake_quant(
 class HIF8FakeQuantFunction(torch.autograd.Function):
     """HiF8 QAT: configurable granularity → tapered precision roundtrip.
     Forward:  scale → _quant_hif8(tensor / scale) → ×scale, where
-        per_group_median uses max(median of |x|, amax/49152) and all other
-        granularities use amax/49152.
+        per_group_median and per_channel_median use max(median of |x|,
+        amax/49152) and all other granularities use amax/49152.
     Backward: STE (Straight-Through Estimator) — gradient passes through unchanged.
         This is the standard QAT convention: forward sees quantized values so
         the loss captures quant-error; backward uses raw gradients so weight
@@ -543,6 +564,9 @@ class HIF8QATLinear(nn.Linear):
         ``"per_group"``    one scale per group of ``group_size`` elements
         ``"per_group_median"``  per group, scale = max(median of |x|,
             amax/HIF8_MAX) — median anchored to 1.0, amax bound prevents truncation
+        ``"per_channel_median"``  per channel, scale = max(median of |x| over
+            the row, amax/HIF8_MAX) — median anchored to 1.0, amax bound
+            prevents truncation
     quantize_activation:
         ``False`` – W8 (weight-only)
         ``True``  – W8A8 (full)

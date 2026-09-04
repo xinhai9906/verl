@@ -108,11 +108,11 @@ def _hif8_fake_quant_inline(
 ) -> torch.Tensor:
     """HiF8 fake quant, identical to _hif8_fake_quant in vllm-ascend.
 
-    Supports per_tensor / per_channel / per_group / per_group_median
-    granularity (per_group_median anchors the median of |x| to 1.0 with
-    amax/HIF8_MAX as the lower bound). Inlined here to avoid
-    ``import vllm_ascend`` in the WorkerDict (training) process, which can
-    trigger NPU-related side effects.
+    Supports per_tensor / per_channel / per_group / per_group_median /
+    per_channel_median granularity (per_group_median and per_channel_median
+    anchor the median of |x| to 1.0 with amax/HIF8_MAX as the lower bound).
+    Inlined here to avoid ``import vllm_ascend`` in the WorkerDict (training)
+    process, which can trigger NPU-related side effects.
     """
     if granularity in ("per_group", "per_group_median"):
         t = tensor.float()
@@ -146,6 +146,23 @@ def _hif8_fake_quant_inline(
         if pad:
             result = result[..., :dim_size]
         return result.to(tensor.dtype)
+    elif granularity == "per_channel_median":
+        # Median of |x| per channel (row): average of the two middle sorted
+        # values (indices dim//2-1, dim//2 for even dim, single middle for
+        # odd), anchored to 1.0, with amax/HIF8_MAX as the lower bound so
+        # truncation never occurs.  No padding — the whole row is sorted, so
+        # there is no tail-group edge case (unlike per_group_median).
+        t = tensor.float()
+        abs_t = t.abs()
+        sorted_vals = abs_t.sort(dim=-1).values
+        dim_size = t.shape[-1]
+        lo = (dim_size - 1) // 2
+        hi = dim_size // 2 + 1
+        median_avg = sorted_vals[..., lo:hi].mean(dim=-1, keepdim=True)
+        median_avg = torch.nan_to_num(median_avg, nan=0.0)
+        amax = abs_t.amax(dim=-1, keepdim=True)
+        scale = torch.maximum(median_avg, amax / _HIF8_MAX).clamp(min=1e-12)
+        return (_quant_hif8_inline(t / scale) * scale).to(tensor.dtype)
     elif granularity == "per_channel":
         amax = tensor.float().abs().amax(dim=-1, keepdim=True)
     else:
@@ -171,9 +188,12 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
     linear weights are therefore rotated by the same Q (block Hadamard ×
     random signs, applied on the in_features dim) BEFORE fake quantisation,
     exactly matching the QAT forward: ``y = fq(xQ) @ fq(WQ)^T = x @ W^T``.
-    MoE expert weights are NOT rotated — the fused MoE path is unrotated
-    on both sides (down_proj rotates along the intermediate dim produced
-    inside the fused kernel, where the Q@Q^T cancellation cannot hold).
+    MoE expert weights are rotated the same way (gate/up on the hidden dim,
+    down_proj on the intermediate dim); vLLM's MoE scheme rotates the MoE
+    input and the intermediate activation at runtime so the Q@Q^T
+    cancellation holds there too.  The router gate weight passes through
+    unrotated: vLLM's router consumes the unrotated hidden states, which is
+    equivalent to training (where both are rotated together).
 
     The quantise-or-not decision mirrors ``vllm_async_server._apply_quantization``
     exactly: the vLLM engine runs the HiF8 scheme only when QAT is enabled,
@@ -192,10 +212,6 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
         re.compile(r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)\.weight$"),
         re.compile(r".*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$"),
         re.compile(r".*\.mlp\.(gate_proj|up_proj|down_proj)\.weight$"),
-    ]
-    # vLLM's MoE scheme does not rotate — keep expert weights in the original basis.
-    _NO_ROTATE_PATTERNS = [
-        re.compile(r".*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$"),
     ]
 
     from verl.workers.rollout.utils import ensure_async_iterator
@@ -262,7 +278,7 @@ async def _pre_quantize_weights(weights, *, qat_config: dict | None = None):
         if _ignored(name) or not any(p.search(name) for p in _QUANTIZE_PATTERNS):
             yield name, tensor
             continue
-        if rotation_config.enable and not any(p.search(name) for p in _NO_ROTATE_PATTERNS):
+        if rotation_config.enable:
             tensor = apply_block_rotation(tensor.contiguous(), rotation_config)
         yield name, _hif8_fake_quant_inline(tensor, granularity, group_size).contiguous()
 
